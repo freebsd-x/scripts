@@ -1,0 +1,107 @@
+#!/bin/sh
+# scripts/devstart - Developer launcher for FreeBSD-X.
+#
+# Boots straight to the DESKTOP (skips the login greeter) and captures every
+# line of output to logs/devstart.log so failures are inspectable after the
+# fact. Unlike scripts/startx, the hardware sentinel is advisory (non-fatal)
+# here so a failing diag probe doesn't block iteration.
+#
+# Usage:
+#   scripts/devstart                 # boot straight to the desktop
+#   KEEP_GREETER=1 scripts/devstart  # show the login greeter instead
+#   HEADLESS=1 scripts/devstart      # offscreen compositor + manual xshell
+#                                    # (safe: does NOT touch the live seat)
+#
+# IMPORTANT: run the normal (non-HEADLESS) mode from a CLEAN TTY
+# (Ctrl+Alt+F2), never from inside an existing graphical session — the
+# compositor needs exclusive DRM master.
+
+set -u
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+BUILD_DIR="$ROOT_DIR/out"
+LOG_DIR="$ROOT_DIR/logs"
+LOG="$LOG_DIR/devstart.log"
+SOCK="/tmp/freebsdx.sock"
+
+mkdir -p "$LOG_DIR"
+: > "$LOG"                      # truncate this run's log
+log() { echo "$@" | tee -a "$LOG"; }
+
+# ── Clean up any old instances + stale sockets ──────────────────────────────
+log "=> Cleaning up old instances..."
+pkill -9 xshell   2>/dev/null || true
+pkill -9 xlogin   2>/dev/null || true
+pkill -9 freebsdx 2>/dev/null || true
+rm -f "$SOCK" /tmp/freebsd-x.sock
+sleep 1
+
+# ── HEADLESS mode: offscreen compositor + manual shell (never touches seat) ──
+if [ "${HEADLESS:-0}" = "1" ]; then
+    log "=> HEADLESS: starting offscreen compositor..."
+    LD_LIBRARY_PATH="$BUILD_DIR" "$BUILD_DIR/freebsdx" --headless >> "$LOG" 2>&1 &
+    FBX_PID=$!
+    i=0
+    while [ ! -S "$SOCK" ]; do
+        kill -0 "$FBX_PID" 2>/dev/null || { log "ERROR: compositor died. See $LOG"; exit 1; }
+        sleep 0.5; i=$((i+1)); [ "$i" -ge 60 ] && { log "ERROR: socket timeout."; exit 1; }
+    done
+    log "=> Launching xshell against the offscreen compositor..."
+    log "   (set FBX_DUMP=/tmp/freebsdx-dump.bin to capture the render target)"
+    XBUS_SOCKET="$SOCK" LD_LIBRARY_PATH="$BUILD_DIR" "$BUILD_DIR/xshell" >> "$LOG" 2>&1 &
+    log "=> Up. Full log: $LOG  (Ctrl+C to stop)"
+    trap 'pkill -9 xshell freebsdx 2>/dev/null; exit' INT TERM
+    wait "$FBX_PID"
+    exit 0
+fi
+
+# ── Refuse to run from inside a graphical session (DRM master conflict) ──────
+if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ] \
+   || pgrep -x Xorg >/dev/null 2>&1 || pgrep -x sway >/dev/null 2>&1; then
+    log "ERROR: A display server is already running (DISPLAY='${DISPLAY:-}' WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-}')."
+    log "       Launch from a clean text TTY (Ctrl+Alt+F2), not from your desktop."
+    exit 1
+fi
+
+# ── Hardware sentinel — advisory only in dev mode ───────────────────────────
+if [ -x "$BUILD_DIR/freebsdx-diag" ]; then
+    log "=> Hardware diag (advisory; failures do not block dev boot)..."
+    if "$BUILD_DIR/freebsdx-diag" >> "$LOG" 2>&1; then
+        log "   diag: OK"
+    else
+        log "   diag: WARNING — reported problems, continuing anyway. See $LOG"
+    fi
+fi
+
+# ── Greeter vs. straight-to-desktop ─────────────────────────────────────────
+if [ "${KEEP_GREETER:-0}" = "1" ]; then
+    SKIP=0; log "=> Booting WITH the login greeter."
+else
+    SKIP=1; log "=> Booting straight to the DESKTOP (greeter skipped)."
+fi
+
+# Emergency cleanup on Ctrl+C / TERM.
+trap 'log "=> Shutting down..."; pkill -9 xshell xlogin freebsdx 2>/dev/null; exit' INT TERM
+
+# ── Launch the compositor ───────────────────────────────────────────────────
+# Output is redirected strictly to the log file (never the terminal): mixing
+# stdout with the VT while the compositor holds DRM master corrupts the console.
+log "=> Starting freebsdx (skip_greeter=$SKIP)..."
+FREEBSDX_SKIP_GREETER="$SKIP" LIBSEAT_LOG_LEVEL=debug "$BUILD_DIR/freebsdx" >> "$LOG" 2>&1 &
+FBX_PID=$!
+
+# ── Wait for the IPC socket (or an early crash) ─────────────────────────────
+log "=> Waiting for $SOCK ..."
+i=0
+while [ ! -S "$SOCK" ]; do
+    if ! kill -0 "$FBX_PID" 2>/dev/null; then
+        log "ERROR: compositor exited before creating the socket."
+        log "       Last log lines:"; tail -n 20 "$LOG"
+        exit 1
+    fi
+    sleep 0.5; i=$((i+1))
+    [ "$i" -ge 60 ] && { log "ERROR: socket timeout. See $LOG"; kill -9 "$FBX_PID"; exit 1; }
+done
+
+log "=> Desktop is UP.  Full log: $LOG"
+log "=> Exit with Ctrl+C here, or Ctrl+Alt+Esc on the keyboard."
+wait "$FBX_PID"

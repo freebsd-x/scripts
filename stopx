@@ -1,0 +1,22 @@
+#!/bin/sh
+# scripts/stopx - Gracefully terminates the FreeBSD-X ecosystem
+
+echo "=> Stopping FreeBSD-X Stack..."
+
+pkill -f "out/demoapp" || true
+pkill -f "out/xshell" || true
+pkill -f "out/freebsdx" || true
+
+# Give processes a moment to shut down cleanly
+sleep 1
+
+# Force kill any stragglers
+pkill -9 -f "out/demoapp" || true
+pkill -9 -f "out/xshell" || true
+pkill -9 -f "out/freebsdx" || true
+
+# Clean up IPC sockets
+rm -f /tmp/freebsdx.sock
+rm -f /tmp/freebsd-x*.sock
+
+echo "=> Stack stopped."

@@ -1,0 +1,90 @@
+#!/bin/sh
+# scripts/startx - Starts the FreeBSD-X Display Server and Ecosystem
+# Hardened for Production Laptop use with Emergency Exit.
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+BUILD_DIR="$ROOT_DIR/out"
+LOG_DIR="$ROOT_DIR/logs"
+
+mkdir -p "$LOG_DIR"
+rm -f "/tmp/freebsdx.sock"
+rm -f "/tmp/freebsd-x.sock"
+
+# Emergency Cleanup on Ctrl+C
+trap 'echo "\n=> Shutting down..."; "$ROOT_DIR/scripts/stopx"; exit' INT TERM
+
+echo "=> Performing Pre-Flight Physical Hardware Diag..."
+if ! "$BUILD_DIR/freebsdx-diag"; then
+    echo "----------------------------------------------------"
+    echo "ERROR: Physical Hardware Sentinel FAILED."
+    echo "Please resolve the issues above before booting."
+    echo "----------------------------------------------------"
+    exit 1
+fi
+
+sleep 1 # Hardware cooldown after diag probe
+
+# 1. Check for display server conflicts
+if pgrep -x "Xorg" > /dev/null || pgrep -x "sway" > /dev/null || [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
+    echo "ERROR: A display server is already running ($DISPLAY $WAYLAND_DISPLAY)."
+    echo "FreeBSD-X must be run from a clean TTY (Ctrl+Alt+F2)."
+    echo "Please log out of your current desktop and run this from the console."
+    exit 1
+fi
+
+echo "=> Cleaning up any old instances..."
+"$ROOT_DIR/scripts/stopx" 2>/dev/null || true
+
+echo "=> Starting Master Compositor (freebsdx)..."
+echo "=> (Note: You do NOT need sudo if you are in the 'video' group)"
+
+# We run freebsdx in the background but monitor its PID.
+# Redirecting strictly to a file prevents VT/TTY driver conflicts with DRM.
+# Default device source: the xsessiond OpenDevice broker (requires xsessiond
+# running — rc.d service). freebsdx grabs the console keyboard itself
+# (KDSKBMODE K_CODE on its VT) so keystrokes don't leak to the shell — this is the
+# compositor's job, not seatd's. Set XSESSIOND_USE_BROKER=0 to fall back to the
+# libseat→seatd path (also works; same in-compositor keyboard grab). If xsessiond is
+# down the compositor auto-falls back to libseat.
+LIBSEAT_LOG_LEVEL=debug "$BUILD_DIR/freebsdx" > "$LOG_DIR/freebsdx.log" 2>&1 &
+FREEBSDX_PID=$!
+
+# 2. Monitor for early crash
+sleep 1
+if ! kill -0 $FREEBSDX_PID 2>/dev/null; then
+    echo "ERROR: Master compositor CRASHED immediately."
+    echo "--- LOG SNIPPET ---"
+    tail -n 20 "$LOG_DIR/freebsdx.log"
+    echo "-------------------"
+    exit 1
+fi
+
+# 3. Wait for Handshake Socket
+echo "=> Waiting for IPC socket (/tmp/freebsdx.sock)..."
+MAX_TRIES=60
+COUNT=0
+while [ ! -S "/tmp/freebsdx.sock" ]; do
+    if ! kill -0 $FREEBSDX_PID 2>/dev/null; then
+        echo "ERROR: Compositor died while waiting for socket."
+        tail -n 10 "$LOG_DIR/freebsdx.log"
+        exit 1
+    fi
+    sleep 0.5
+    COUNT=$((COUNT+1))
+    if [ $COUNT -ge $MAX_TRIES ]; then
+        echo "ERROR: Socket timed out. Check $LOG_DIR/freebsdx.log"
+        kill -9 $FREEBSDX_PID
+        exit 1
+    fi
+done
+
+echo "=> Master is READY. GUI Shell is managed by Core Supervisor."
+
+echo "=========================================="
+echo " FreeBSD-X Stack is RUNNING!"
+echo " Logs: $LOG_DIR"
+echo " PRESS Ctrl+C in this terminal or ESC on keyboard to Exit."
+echo "=========================================="
+
+# 4. Wait for processes to exit
+wait $FREEBSDX_PID
