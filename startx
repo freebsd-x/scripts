@@ -13,6 +13,27 @@ rm -f "/tmp/freebsd-x.sock"
 # Emergency Cleanup on Ctrl+C
 trap 'echo "\n=> Shutting down..."; "$ROOT_DIR/scripts/stopx"; exit' INT TERM
 
+# 0. Make sure the session binaries still resolve their shared libraries.
+# A `pkg upgrade` can bump a system library's soname (e.g. ffmpeg 8->9 moved
+# libavformat.so.62 -> .63) and ninja won't notice, leaving out/ unrunnable.
+echo "=> Checking shared libraries..."
+MISSING=""
+for bin in freebsdx freebsdx-diag xlogin xshell; do
+    [ -x "$BUILD_DIR/$bin" ] || continue
+    libs=$(ldd "$BUILD_DIR/$bin" 2>/dev/null | awk '/not found/ { print $1 }')
+    [ -n "$libs" ] && MISSING="$MISSING $bin: $(echo $libs)
+"
+done
+if [ -n "$MISSING" ]; then
+    echo "----------------------------------------------------"
+    echo "ERROR: Some binaries in out/ need libraries that are no longer installed:"
+    printf "%s" "$MISSING"
+    echo "A system package upgrade probably changed them. Rebuild with:"
+    echo "    ninja -C $BUILD_DIR"
+    echo "----------------------------------------------------"
+    exit 1
+fi
+
 echo "=> Performing Pre-Flight Physical Hardware Diag..."
 if ! "$BUILD_DIR/freebsdx-diag"; then
     echo "----------------------------------------------------"
@@ -21,8 +42,6 @@ if ! "$BUILD_DIR/freebsdx-diag"; then
     echo "----------------------------------------------------"
     exit 1
 fi
-
-sleep 1 # Hardware cooldown after diag probe
 
 # 1. Check for display server conflicts
 if pgrep -x "Xorg" > /dev/null || pgrep -x "sway" > /dev/null || [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
@@ -49,27 +68,19 @@ echo "=> (Note: You do NOT need sudo if you are in the 'video' group)"
 LIBSEAT_LOG_LEVEL=debug "$BUILD_DIR/freebsdx" > "$LOG_DIR/freebsdx.log" 2>&1 &
 FREEBSDX_PID=$!
 
-# 2. Monitor for early crash
-sleep 1
-if ! kill -0 $FREEBSDX_PID 2>/dev/null; then
-    echo "ERROR: Master compositor CRASHED immediately."
-    echo "--- LOG SNIPPET ---"
-    tail -n 20 "$LOG_DIR/freebsdx.log"
-    echo "-------------------"
-    exit 1
-fi
-
-# 3. Wait for Handshake Socket
+# 2. Wait for Handshake Socket (the loop also catches an early crash)
 echo "=> Waiting for IPC socket (/tmp/freebsdx.sock)..."
-MAX_TRIES=60
+MAX_TRIES=300 # 300 x 0.1s = 30s
 COUNT=0
 while [ ! -S "/tmp/freebsdx.sock" ]; do
     if ! kill -0 $FREEBSDX_PID 2>/dev/null; then
-        echo "ERROR: Compositor died while waiting for socket."
-        tail -n 10 "$LOG_DIR/freebsdx.log"
+        echo "ERROR: Master compositor CRASHED during startup."
+        echo "--- LOG SNIPPET ---"
+        tail -n 20 "$LOG_DIR/freebsdx.log"
+        echo "-------------------"
         exit 1
     fi
-    sleep 0.5
+    sleep 0.1
     COUNT=$((COUNT+1))
     if [ $COUNT -ge $MAX_TRIES ]; then
         echo "ERROR: Socket timed out. Check $LOG_DIR/freebsdx.log"
@@ -86,5 +97,5 @@ echo " Logs: $LOG_DIR"
 echo " PRESS Ctrl+C in this terminal or ESC on keyboard to Exit."
 echo "=========================================="
 
-# 4. Wait for processes to exit
+# 3. Wait for processes to exit
 wait $FREEBSDX_PID
