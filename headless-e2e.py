@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""Headless end-to-end checks for the FreeBSD-X desktop.
+
+Drives a real `out/freebsdx --headless` compositor (plus the real shell and
+apps where a scenario needs them) and checks what a user would see: files
+open in the right app, the Screen Time card works, the trust gates hold, every
+app starts cleanly, and nothing lays out off-screen.
+
+    python3 scripts/headless-e2e.py              # every scenario
+    python3 scripts/headless-e2e.py --list       # scenario names
+    python3 scripts/headless-e2e.py file-open gates
+    python3 scripts/headless-e2e.py --shots /tmp/shots   # + a capture of every app
+
+Each scenario gets a fresh compositor and a throwaway $HOME, so nothing touches
+your real configuration. It refuses to run while a desktop session is up: the
+compositor must never be started without --headless on a live seat.
+Exit status: 0 if every scenario passed.
+
+Standard library only. Uses netpbm (pnmtopng, pnmcut, pnmscale, pnmcat) for
+--shots only.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import zlib
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT = os.path.join(ROOT, "out")
+SOCK = "/tmp/freebsdx.sock"
+
+XBUS_MAGIC = 0x58425553
+XBUS_FMT = "<II32sI256s"            # magic, transaction, service[32], opcode, payload[256]
+INPUT_FMT = "<IiiIi"                # type, value_a, value_b, modifiers, char_value
+RENDER_MSG_SIZE = 56
+
+# Protocol constants (include/shared/protocol.h).
+SURFACE_CREATED, SURFACE_CLOSED, SHELL_SURFACE_CREATED = 0, 2, 3
+INPUT_MOUSE_MOVE, INPUT_MOUSE_BUTTON = 0, 1
+BTN_LEFT = 272
+HEADLESS_INJECT = 3
+SHELL_LAUNCH_WITH_FILE = 5
+NOTIFICATION_POST = 1
+
+# Oversized-layout reports that are expected (an unbounded table header inside
+# a horizontal scroller).
+LAYOUT_ALLOW = {"taskmanager": 1}
+
+
+class Failed(Exception):
+    pass
+
+
+def check(cond, msg):
+    if not cond:
+        raise Failed(msg)
+
+
+def wait_for(pred, timeout, what):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        v = pred()
+        if v:
+            return v
+        time.sleep(0.2)
+    raise Failed(f"timed out waiting for {what}")
+
+
+# ── Wire helpers ──────────────────────────────────────────────────────────────
+
+def xbus_msg(service, opcode, payload=b"", tid=1):
+    return struct.pack(XBUS_FMT, XBUS_MAGIC, tid, service.encode(), opcode, payload)
+
+
+def connect():
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    s.connect(SOCK)
+    return s
+
+
+def call(service, opcode, payload=b"", timeout=1.5):
+    """Send one XBus request on a fresh connection; return the reply or None."""
+    s = connect()
+    tid = 4242
+    s.send(xbus_msg(service, opcode, payload, tid))
+    s.settimeout(timeout)
+    try:
+        while True:
+            d = s.recv(4096)
+            if len(d) >= 300 and struct.unpack("<I", d[4:8])[0] == tid:
+                return d
+    except socket.timeout:
+        return None
+    finally:
+        s.close()
+
+
+def send(service, opcode, payload=b""):
+    s = connect()
+    s.send(xbus_msg(service, opcode, payload))
+    time.sleep(0.2)
+    s.close()
+
+
+def render_msg(surface_id, status, w=400, h=300):
+    return struct.pack("<IIII", surface_id, status, w, h).ljust(RENDER_MSG_SIZE, b"\0")
+
+
+def recv_render_reply(s, timeout=2.0):
+    """The next 56-byte RenderMessage on s (skipping broadcasts), or None."""
+    s.settimeout(timeout)
+    try:
+        while True:
+            d = s.recv(4096)
+            if len(d) == RENDER_MSG_SIZE:
+                return struct.unpack("<IIII", d[:16])
+    except socket.timeout:
+        return None
+
+
+class Pointer:
+    """Injected mouse input on one connection (many short ones overflow the
+    compositor's accept backlog). Motion is relative; it clamps at the edges."""
+
+    def __init__(self):
+        self.s = connect()
+
+    def _inject(self, typ, a, b):
+        payload = struct.pack(INPUT_FMT, typ, a, b, 0, 0)
+        self.s.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, payload))
+        time.sleep(0.1)
+
+    def click(self, x, y):
+        self._inject(INPUT_MOUSE_MOVE, -10000, -10000)
+        self._inject(INPUT_MOUSE_MOVE, x, y)
+        time.sleep(0.2)
+        self._inject(INPUT_MOUSE_BUTTON, BTN_LEFT, 1)
+        self._inject(INPUT_MOUSE_BUTTON, BTN_LEFT, 0)
+        time.sleep(0.3)
+
+    def close(self):
+        self.s.close()
+
+
+def launch_with_file(app_id, path):
+    payload = app_id.encode().ljust(64, b"\0") + path.encode().ljust(188, b"\0")
+    send("com.freebsdx.Shell", SHELL_LAUNCH_WITH_FILE, payload)
+
+
+def write_png(path, w, h, rgb):
+    raw = b"".join(b"\0" + bytes(rgb) * w for _ in range(h))
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+# ── Processes ─────────────────────────────────────────────────────────────────
+
+def live_session():
+    """Is a desktop session (or a stray compositor) running?"""
+    if os.path.exists(SOCK):
+        return "a compositor socket exists at " + SOCK
+    r = subprocess.run(["pgrep", "-f", OUT + "/freebsdx"], capture_output=True, text=True)
+    if r.stdout.strip():
+        return "a freebsdx process is running"
+    return None
+
+
+def built_apps():
+    """(binary name, path) of every app bundle with a built binary."""
+    apps = []
+    apps_dir = os.path.join(ROOT, "apps")
+    for bundle in sorted(os.listdir(apps_dir)):
+        if not bundle.endswith(".xapp"):
+            continue
+        base = bundle[:-5].lower()
+        try:
+            m = re.search(r'"executable":\s*"([^"]*)"', open(os.path.join(apps_dir, bundle, "manifest.json")).read())
+            if m:
+                base = os.path.basename(m.group(1)).lower()
+        except OSError:
+            pass
+        for cand in (base, base + "_app"):
+            p = os.path.join(OUT, cand)
+            if os.access(p, os.X_OK):
+                apps.append((cand, p))
+                break
+    return apps
+
+
+class Session:
+    """A headless compositor with a throwaway $HOME, plus whatever a scenario
+    starts in it. Everything is torn down on exit."""
+
+    def __init__(self, workdir, name, strict=False, config=None):
+        self.home = os.path.join(workdir, name, "home")
+        self.logs = os.path.join(workdir, name)
+        os.makedirs(os.path.join(self.home, ".config", "freebsd-x"), exist_ok=True)
+        if config:
+            with open(os.path.join(self.home, ".config", "freebsd-x", "config"), "w") as f:
+                f.write(config)
+        self.strict = strict
+        self.procs = []
+
+    def env(self, **extra):
+        e = dict(os.environ, HOME=self.home)
+        e.update(extra)
+        return e
+
+    def log(self, name):
+        return os.path.join(self.logs, name + ".log")
+
+    def read_log(self, name):
+        try:
+            return open(self.log(name), "rb").read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def start(self, name, argv, **env):
+        f = open(self.log(name), "wb")
+        p = subprocess.Popen(argv, cwd=ROOT, env=self.env(**env), stdout=f, stderr=subprocess.STDOUT,
+                             start_new_session=True)   # own group: its children die with it
+        self.procs.append(p)
+        return p
+
+    def __enter__(self):
+        argv = [os.path.join(OUT, "freebsdx"), "--headless"] + (["--strict-shell-trust"] if self.strict else [])
+        self.start("compositor", argv)
+        wait_for(lambda: os.path.exists(SOCK), 15, "the compositor socket")
+        time.sleep(1.0)
+        return self
+
+    def shell(self):
+        self.start("xshell", [os.path.join(OUT, "xshell")])
+        wait_for(lambda: "Shell Surface CREATED (ID: 999)" in self.read_log("compositor"), 20, "the shell surface")
+        time.sleep(2.0)
+
+    def __exit__(self, *exc):
+        for p in reversed(self.procs):
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        deadline = time.time() + 5
+        for p in self.procs:
+            try:
+                p.wait(max(0.1, deadline - time.time()))
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        wait_for(lambda: not os.path.exists(SOCK), 10, "the compositor socket to go away")
+        return False
+
+
+def procs_running(binary_path):
+    """How many processes run this binary (xshell launches apps by the
+    relative path out/<name>, so match on that, not the absolute path)."""
+    rel = "out/" + os.path.basename(binary_path)
+    r = subprocess.run(["pgrep", "-f", "(^|/)" + re.escape(rel) + "( |$)"], capture_output=True, text=True)
+    return len(r.stdout.split())
+
+
+# ── Scenarios ─────────────────────────────────────────────────────────────────
+
+def s_file_open(work):
+    """Opening a file launches its app; a second file reuses the open window."""
+    a, b = os.path.join(work, "first.png"), os.path.join(work, "second.png")
+    write_png(a, 64, 64, (220, 40, 40))
+    write_png(b, 64, 64, (40, 200, 40))
+    viewer = os.path.join(OUT, "imageviewer")
+    with Session(work, "file-open") as s:
+        s.shell()
+        launch_with_file("com.freebsdx.imageviewer", a)
+        wait_for(lambda: "Image Viewer — first.png" in s.read_log("compositor"), 15, "the viewer to open first.png")
+        check(procs_running(viewer) == 1, "expected one Image Viewer")
+        launch_with_file("com.freebsdx.imageviewer", b)
+        wait_for(lambda: "Image Viewer — second.png" in s.read_log("compositor"), 10, "the open viewer to show second.png")
+        check(procs_running(viewer) == 1, f"a second file started another viewer ({procs_running(viewer)} running)")
+
+
+def s_times_up(work):
+    """An app at its daily limit gets the Time's-up card; Close app ends it."""
+    a = os.path.join(work, "limit.png")
+    write_png(a, 32, 32, (40, 40, 220))
+    day = time.strftime("%Y-%m-%d")
+    config = (f"applimit.limits=com.freebsdx.imageviewer=1\n"
+              f"applimit.usage={day}|com.freebsdx.imageviewer=50\n")
+    viewer = os.path.join(OUT, "imageviewer")
+    with Session(work, "times-up", strict=True, config=config) as s:
+        s.shell()
+        launch_with_file("com.freebsdx.imageviewer", a)
+        wait_for(lambda: procs_running(viewer) == 1, 10, "the viewer to start")
+        wait_for(lambda: "reached its 1 min limit" in s.read_log("compositor"), 30, "the time limit")
+        # The card is the 420x150 layer the shell reports as its input region.
+        m = wait_for(lambda: re.search(r"420x150@(\d+),(\d+)", s.read_log("compositor")), 10, "the Time's-up card")
+        x, y = int(m.group(1)), int(m.group(2))
+        ptr = Pointer()
+        ptr.click(x + 374, y + 89)          # "Close app" (right-aligned in the card's button row)
+        ptr.close()
+        wait_for(lambda: "closed 1 window(s) of com.freebsdx.imageviewer" in s.read_log("compositor"), 10, "Close app")
+        wait_for(lambda: procs_running(viewer) == 0, 10, "the viewer process to exit")
+        check("App crashed" not in s.read_log("compositor"), "closing the app was reported as a crash")
+
+
+def s_shell_trust(work):
+    """Only the shell binaries may register the trusted shell surface."""
+    def claim(status):
+        c = connect()
+        c.send(render_msg(999, status))
+        r = recv_render_reply(c)
+        c.close()
+        return r
+    with Session(work, "shell-trust", strict=True) as s:
+        r = claim(SHELL_SURFACE_CREATED)
+        check(r and r[2] == 0 and r[3] == 0, f"an impostor's shell claim wasn't refused ({r})")
+        r = claim(SURFACE_CREATED)
+        check(r and r[2] == 0, f"a plain window took the shell's id 999 ({r})")
+        s.shell()                            # the real shell is accepted
+        r = claim(SHELL_SURFACE_CREATED)
+        check(r and r[2] == 0, f"an impostor took over the running shell's surface ({r})")
+
+
+def s_surface_ownership(work):
+    """A client can't close or take over another client's window."""
+    with Session(work, "surface-ownership", strict=True) as s:
+        a = connect()
+        a.send(render_msg(77, SURFACE_CREATED))
+        check(recv_render_reply(a), "window 77 wasn't created")
+        b = connect()
+        b.send(render_msg(77, SURFACE_CLOSED))
+        time.sleep(0.6)
+        b.send(render_msg(77, SURFACE_CREATED))
+        r = recv_render_reply(b)
+        check(r and r[2] == 0, f"another client took over window 77 ({r})")
+        time.sleep(0.3)
+        check("Removing Window ID: 77" not in s.read_log("compositor"), "another client closed window 77")
+        a.close()
+        b.close()
+
+
+def s_gates(work):
+    """Untrusted calls to gated services are refused; reads stay open; a
+    built-in app is recognized by its executable."""
+    key = b"screenlock.enabled"
+    with Session(work, "gates", strict=True) as s:
+        refused = [("com.freebsdx.Firewall", 0x02, struct.pack("<I", 1)),
+                   ("com.freebsdx.Keychain", 0x01, b""),
+                   ("com.freebsdx.Configuration", 0x02, key),
+                   ("com.freebsdx.Terminal", 0x03, b""),
+                   ("com.freebsdx.Power", 0x04, b""),          # Reboot
+                   ("com.freebsdx.Window", 0x02, struct.pack("<I", 999))]
+        for svc, op, payload in refused:
+            check(call(svc, op, payload) is None, f"{svc} op {op} answered an untrusted client")
+        log = s.read_log("compositor")
+        check(log.count("DENIED") >= len(refused), "denials weren't logged")
+        check(call("com.freebsdx.Configuration", 0x01, key) is not None, "a config read was refused")
+        check(call("com.freebsdx.Power", 0x01) is not None, "a power-state read was refused")
+        s.start("terminal", [os.path.join(OUT, "terminal")])
+        wait_for(lambda: "Created session" in s.read_log("compositor"), 10, "the Terminal app's session")
+
+
+def s_apps_start(work):
+    """The shell and every app start with no denied calls and no crash."""
+    problems = []
+    with Session(work, "apps-start", strict=True) as s:
+        s.shell()
+        for name, path in built_apps():
+            before = s.read_log("compositor").count("DENIED")
+            p = s.start(name, [path])
+            time.sleep(4)
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            p.wait()
+            app_log = s.read_log(name)
+            if "FreeBSD-X crash" in app_log or "Terminating due to uncaught exception" in app_log:
+                problems.append(f"{name} crashed")
+            if s.read_log("compositor").count("DENIED") > before:
+                problems.append(f"{name} was denied a call")
+        if "DENIED" in s.read_log("xshell"):
+            problems.append("the shell was denied a call")
+    check(not problems, "; ".join(problems))
+
+
+def audit_count(text):
+    m = re.search(r"\[layout-audit\] (\d+) oversized", text)
+    return int(m.group(1)) if m else None
+
+
+def s_layout_audit(work):
+    """No widget lays out absurdly large (the off-screen-content bug)."""
+    problems = []
+    with Session(work, "layout-audit") as s:
+        s.start("xshell", [os.path.join(OUT, "xshell")], FBX_LAYOUT_AUDIT="1")
+        wait_for(lambda: audit_count(s.read_log("xshell")) is not None, 20, "the shell's layout audit")
+        n = audit_count(s.read_log("xshell"))
+        if n:
+            problems.append(f"shell: {n} oversized")
+        for name, path in built_apps():
+            p = s.start(name, [path], FBX_LAYOUT_AUDIT="1")
+            try:
+                wait_for(lambda: audit_count(s.read_log(name)) is not None, 8, f"{name}'s layout audit")
+            except Failed:
+                pass   # an app that paints no frames (e.g. a GPU demo) has nothing to audit
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            p.wait()
+            n = audit_count(s.read_log(name))
+            if n and n > LAYOUT_ALLOW.get(name, 0):
+                detail = [l for l in s.read_log(name).splitlines() if "[layout-audit]" in l][:3]
+                problems.append(f"{name}: {n} oversized ({'; '.join(detail)})")
+    check(not problems, " | ".join(problems))
+
+
+def s_smoke_tools(work):
+    """Every freebsdx-*-smoke tool passes against a fresh compositor."""
+    tools = sorted(f for f in os.listdir(OUT) if f.startswith("freebsdx-") and f.endswith("-smoke"))
+    check(tools, "no smoke tools are built")
+    failed = []
+    for t in tools:
+        with Session(work, "smoke-" + t) as s:
+            r = subprocess.run([os.path.join(OUT, t)], cwd=ROOT, env=s.env(), capture_output=True, timeout=60)
+            if r.returncode != 0:
+                failed.append(t)
+    check(not failed, "failed: " + ", ".join(failed))
+
+
+SCENARIOS = {
+    "file-open": s_file_open,
+    "times-up": s_times_up,
+    "shell-trust": s_shell_trust,
+    "surface-ownership": s_surface_ownership,
+    "gates": s_gates,
+    "apps-start": s_apps_start,
+    "layout-audit": s_layout_audit,
+    "smoke-tools": s_smoke_tools,
+}
+
+
+# ── Screenshots ───────────────────────────────────────────────────────────────
+
+def take_shots(work, dest):
+    """A capture of every app (its window region) plus a contact sheet."""
+    for tool in ("pnmtopng", "pnmcut", "pnmscale", "pnmcat"):
+        if not shutil.which(tool):
+            raise Failed(f"--shots needs netpbm ({tool} not found)")
+    os.makedirs(dest, exist_ok=True)
+    capture = os.path.join(OUT, "freebsdx-headless-capture")
+    thumbs = []
+    with Session(work, "shots") as s:
+        for name, path in built_apps():
+            p = s.start(name, [path])
+            time.sleep(4)
+            ppm = os.path.join(s.logs, name + ".ppm")
+            subprocess.run([capture, ppm], capture_output=True, timeout=15)
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            p.wait()
+            if not os.path.exists(ppm):
+                continue
+            win = subprocess.run(["pnmcut", "360", "100", "1200", "880", ppm], capture_output=True).stdout
+            with open(os.path.join(dest, name + ".png"), "wb") as f:
+                f.write(subprocess.run(["pnmtopng"], input=win, capture_output=True).stdout)
+            th = os.path.join(s.logs, name + ".th.ppm")
+            with open(th, "wb") as f:
+                f.write(subprocess.run(["pnmscale", "-xsize", "360"], input=win, capture_output=True).stdout)
+            thumbs.append(th)
+        rows = []
+        for i in range(0, len(thumbs), 4):
+            row = os.path.join(s.logs, f"row{i}.ppm")
+            with open(row, "wb") as f:
+                f.write(subprocess.run(["pnmcat", "-lr", "-jtop"] + thumbs[i:i + 4], capture_output=True).stdout)
+            rows.append(row)
+        if rows:
+            sheet = subprocess.run(["pnmcat", "-tb", "-jleft"] + rows, capture_output=True).stdout
+            with open(os.path.join(dest, "contact-sheet.png"), "wb") as f:
+                f.write(subprocess.run(["pnmtopng"], input=sheet, capture_output=True).stdout)
+    print(f"  shots: {len(thumbs)} apps → {dest} (contact-sheet.png)")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Headless end-to-end checks for FreeBSD-X.")
+    ap.add_argument("scenarios", nargs="*", help="scenarios to run (default: all)")
+    ap.add_argument("--list", action="store_true", help="list the scenarios")
+    ap.add_argument("--shots", metavar="DIR", help="also capture every app into DIR")
+    ap.add_argument("--keep", action="store_true", help="keep the logs and scratch homes")
+    args = ap.parse_args()
+
+    if args.list:
+        for name, fn in SCENARIOS.items():
+            print(f"{name:18} {fn.__doc__.splitlines()[0]}")
+        return 0
+    unknown = [n for n in args.scenarios if n not in SCENARIOS]
+    if unknown:
+        print("unknown scenario(s): " + ", ".join(unknown), file=sys.stderr)
+        return 2
+    busy = live_session()
+    if busy:
+        print(f"refusing to run: {busy} (stop the desktop session first)", file=sys.stderr)
+        return 2
+    if not os.access(os.path.join(OUT, "freebsdx"), os.X_OK):
+        print("out/freebsdx isn't built (ninja -C out)", file=sys.stderr)
+        return 2
+
+    work = tempfile.mkdtemp(prefix="fbx-e2e.")
+    failed = 0
+    names = args.scenarios or list(SCENARIOS)
+    for name in names:
+        t0 = time.time()
+        try:
+            SCENARIOS[name](work)
+            print(f"  PASS  {name:18} {time.time() - t0:5.1f}s")
+        except Failed as e:
+            failed += 1
+            print(f"  FAIL  {name:18} {time.time() - t0:5.1f}s  {e}")
+        except Exception as e:   # a broken scenario shouldn't hide the others
+            failed += 1
+            print(f"  ERROR {name:18} {type(e).__name__}: {e}")
+    if args.shots:
+        try:
+            take_shots(work, args.shots)
+        except Failed as e:
+            failed += 1
+            print(f"  FAIL  shots: {e}")
+    if args.keep or failed:
+        print(f"  logs: {work}")
+    else:
+        shutil.rmtree(work, ignore_errors=True)
+    print(f"{'PASS' if not failed else 'FAIL'}: {failed} failure(s) in {len(names)} scenario(s)"
+          + (" + shots" if args.shots else ""))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
