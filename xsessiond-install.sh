@@ -51,7 +51,7 @@ sysrc xsessiond_enable=YES >/dev/null
 # Only these compositor binaries may use the daemon: the dev builds in this
 # checkout and the installed one. (A compositor started from anywhere else
 # can't log in or unlock — add its path here and re-run.)
-COMPOSITORS="${REPO}/out/freebsdx:${REPO}/builddir/freebsdx:/usr/local/bin/freebsdx"
+COMPOSITORS="${REPO}/out/freebsdx:${REPO}/builddir/freebsdx:/usr/local/bin/freebsdx:/usr/local/bin/xserver"
 echo "=> allowed compositors: ${COMPOSITORS}"
 sysrc xsessiond_compositor="${COMPOSITORS}" >/dev/null
 
