@@ -48,6 +48,12 @@ echo "=> installing rc.d     -> $RCD_DST"
 install -m 755 "$RCD_SRC" "$RCD_DST"
 echo "=> enabling in /etc/rc.conf (xsessiond_enable=YES)"
 sysrc xsessiond_enable=YES >/dev/null
+# Only these compositor binaries may use the daemon: the dev builds in this
+# checkout and the installed one. (A compositor started from anywhere else
+# can't log in or unlock — add its path here and re-run.)
+COMPOSITORS="${REPO}/out/freebsdx:${REPO}/builddir/freebsdx:/usr/local/bin/freebsdx"
+echo "=> allowed compositors: ${COMPOSITORS}"
+sysrc xsessiond_compositor="${COMPOSITORS}" >/dev/null
 
 echo "=> starting service"
 service xsessiond start
