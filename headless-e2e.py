@@ -64,8 +64,11 @@ def check(cond, msg):
         raise Failed(msg)
 
 
+TIME_SCALE = 1        # --asan: sanitized binaries start and run several times slower
+
+
 def wait_for(pred, timeout, what):
-    deadline = time.time() + timeout
+    deadline = time.time() + timeout * TIME_SCALE
     while time.time() < deadline:
         v = pred()
         if v:
@@ -168,11 +171,35 @@ def write_png(path, w, h, rgb):
 
 # ── Processes ─────────────────────────────────────────────────────────────────
 
+SANITIZER_RE = re.compile(r"(ERROR: AddressSanitizer: .*|\S+: runtime error: .*)")
+
+
+def sanitizer_reports(work, scanned):
+    """Distinct sanitizer reports ("<log>: <first line>") in logs not yet scanned."""
+    found = []
+    for dirpath, _, files in os.walk(work):
+        for fn in files:
+            path = os.path.join(dirpath, fn)
+            if not fn.endswith(".log") or path in scanned:
+                continue
+            scanned.add(path)
+            seen = set()
+            for line in open(path, "rb").read().decode("utf-8", "replace").splitlines():
+                m = SANITIZER_RE.search(line)
+                if m:
+                    # Same site reported per-call: keep one per source location.
+                    key = re.sub(r"0x[0-9a-f]+", "", m.group(1))
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(f"{os.path.relpath(path, work)}: {m.group(1)[:160]}")
+    return found
+
+
 def live_session():
     """Is a desktop session (or a stray compositor) running?"""
     if os.path.exists(SOCK):
         return "a compositor socket exists at " + SOCK
-    r = subprocess.run(["pgrep", "-f", OUT + "/freebsdx"], capture_output=True, text=True)
+    r = subprocess.run(["pgrep", "-x", "freebsdx"], capture_output=True, text=True)   # any build dir
     if r.stdout.strip():
         return "a freebsdx process is running"
     return None
@@ -238,7 +265,11 @@ class Session:
     def __enter__(self):
         argv = [os.path.join(OUT, "freebsdx"), "--headless"] + (["--strict-shell-trust"] if self.strict else [])
         self.start("compositor", argv)
-        wait_for(lambda: os.path.exists(SOCK), 15, "the compositor socket")
+        try:
+            wait_for(lambda: os.path.exists(SOCK), 15, "the compositor socket")
+        except BaseException:
+            self.__exit__()   # a failed start must not leave a compositor behind
+            raise
         time.sleep(1.0)
         return self
 
@@ -262,6 +293,10 @@ class Session:
                     os.killpg(p.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                p.wait()
+                # A killed compositor can't unlink its socket.
+                if p is self.procs[0] and os.path.exists(SOCK):
+                    os.unlink(SOCK)
         wait_for(lambda: not os.path.exists(SOCK), 10, "the compositor socket to go away")
         return False
 
@@ -418,8 +453,8 @@ class Keys:
         for state in (1, 0):
             payload = struct.pack(INPUT_FMT, 2, code, state, 1 if shift else 0, 0)
             self.s.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, payload))
-            time.sleep(0.15)
-        time.sleep(0.5)
+            time.sleep(0.15 * TIME_SCALE)
+        time.sleep(0.5 * TIME_SCALE)
 
     def close(self):
         self.s.close()
@@ -439,6 +474,7 @@ def s_screen_reader(work):
         sess.start("settings", [os.path.join(OUT, "settings_app")])
         spoken = lambda: open(log).read().splitlines() if os.path.exists(log) else []
         wait_for(lambda: "Settings, window" in spoken(), 15, "the window announcement")
+        time.sleep(0.5 * TIME_SCALE)   # the announcement can precede the first full layout
         keys = Keys()
         keys.press(15)            # Tab → the Appearance section
         keys.press(15)            # Tab → Dark Mode
@@ -466,34 +502,37 @@ def s_shell_keyboard(work):
         r = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True)
         return len(r.stdout.split())
 
+    def pause(t):
+        time.sleep(t * TIME_SCALE)
+
     def ev(c, t, a=0, b=0, ch=0):
         c.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, struct.pack(INPUT_FMT, t, a, b, 0, ch)))
-        time.sleep(0.12)
+        pause(0.12)
 
     def key(c, code, ch=""):
         ev(c, 2, code, 1, ord(ch) if ch else 0)
         ev(c, 2, code, 0)
-        time.sleep(0.25)
+        pause(0.25)
 
     with Session(work, "shell-keyboard", strict=True) as s:
         s.shell()
         s.start("calculator", [os.path.join(OUT, "calculator")])
         wait_for(lambda: procs("calculator") == 1, 10, "the calculator to start")
-        time.sleep(2)
+        pause(2)
         c = connect()
         ev(c, 6)                                    # Super+Space (SearchToggle)
-        time.sleep(1.0)
+        pause(1.0)
         for code, ch in ((46, "c"), (30, "a"), (38, "l"), (46, "c")):
             key(c, code, ch)
-        time.sleep(1.5)
+        pause(1.5)
         key(c, 108)                                 # Down → the first result
         key(c, 28)                                  # Enter → open it
         wait_for(lambda: procs("calculator") == 2, 10, "the search result to open")
         check("calc" not in s.read_log("calculator"), "the typing went to the app")
         ev(c, 6)
-        time.sleep(1.0)
+        pause(1.0)
         key(c, 1)                                   # Esc closes search
-        time.sleep(1.0)
+        pause(1.0)
         c.close()
         regions = re.findall(r"\[Shell\] Input region:.*", s.read_log("compositor"))
         check(regions and regions[-1].endswith("(none)"), f"Esc didn't close search ({regions[-1:]})")
@@ -632,7 +671,18 @@ def main():
     ap.add_argument("--list", action="store_true", help="list the scenarios")
     ap.add_argument("--shots", metavar="DIR", help="also capture every app into DIR")
     ap.add_argument("--keep", action="store_true", help="keep the logs and scratch homes")
+    ap.add_argument("--asan", action="store_true",
+                    help="run the out-asan/ (ASan+UBSan) binaries; any sanitizer report fails the scenario")
     args = ap.parse_args()
+    global OUT, TIME_SCALE
+    if args.asan:
+        OUT = os.path.join(ROOT, "out-asan")
+        TIME_SCALE = 3
+        # Shaders are only built into out/. halt_on_error=0 so one report doesn't
+        # hide the next; the scenario fails on any of them.
+        os.environ.update(FREEBSDX_SHADER_DIR=os.path.join(ROOT, "out", "freebsdx.p"),
+                          ASAN_OPTIONS="detect_leaks=0:halt_on_error=0",
+                          UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0")
 
     if args.list:
         for name, fn in SCENARIOS.items():
@@ -647,16 +697,21 @@ def main():
         print(f"refusing to run: {busy} (stop the desktop session first)", file=sys.stderr)
         return 2
     if not os.access(os.path.join(OUT, "freebsdx"), os.X_OK):
-        print("out/freebsdx isn't built (ninja -C out)", file=sys.stderr)
+        d = os.path.basename(OUT)
+        print(f"{d}/freebsdx isn't built (ninja -C {d})", file=sys.stderr)
         return 2
 
     work = tempfile.mkdtemp(prefix="fbx-e2e.")
+    scanned = set()
     failed = 0
     names = args.scenarios or list(SCENARIOS)
     for name in names:
         t0 = time.time()
         try:
             SCENARIOS[name](work)
+            if args.asan:
+                reports = sanitizer_reports(work, scanned)
+                check(not reports, f"{len(reports)} sanitizer report(s): " + "; ".join(reports[:3]))
             print(f"  PASS  {name:18} {time.time() - t0:5.1f}s")
         except Failed as e:
             failed += 1

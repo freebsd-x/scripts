@@ -24,7 +24,13 @@ python3 scripts/headless-e2e.py                 # every scenario (~4 min)
 python3 scripts/headless-e2e.py --list          # scenario names
 python3 scripts/headless-e2e.py gates times-up  # just these
 python3 scripts/headless-e2e.py --shots /tmp/s  # + a capture of every app and a contact sheet
+python3 scripts/headless-e2e.py --asan          # same scenarios on the out-asan/ (ASan+UBSan) build
 ```
+
+`--asan` runs the compositor, shell and every app from `out-asan/` (build it with
+`ninja -C out-asan -j2` — more parallel jobs run an 8 GB machine out of memory on
+the shell's sources) and fails a scenario on any sanitizer report in any log.
+Timeouts are scaled 3×. Apps the shell launches itself still come from `out/`.
 
 `headless-e2e.py` gives each scenario a fresh compositor and a throwaway
 `$HOME`, and refuses to run while a desktop session is up — the compositor
