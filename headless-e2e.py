@@ -562,6 +562,62 @@ def s_apps_start(work):
     check(not problems, "; ".join(problems))
 
 
+def fnv1a64(text):
+    h = 1469598103934665603
+    for b in text.encode():
+        h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"
+
+
+def count_rgb(ppm_path, rgb, step=4):
+    """Pixels (sampling every `step`-th) of exactly colour `rgb` in a P6 capture."""
+    data = open(ppm_path, "rb").read()
+    parts = data.split(b"\n", 3)              # P6, "w h", maxval, pixels
+    pix = memoryview(parts[3])
+    want = bytes(rgb)
+    return sum(1 for i in range(0, len(pix) - 2, 3 * step) if pix[i:i + 3] == want)
+
+
+def s_fetch(work):
+    """Sandboxed Maps gets its tiles through com.freebsdx.Fetch (xfetch's cache,
+    offline here) and draws them; other callers and fake providers are refused."""
+    FETCH, GET, REGISTER = "com.freebsdx.Fetch", 0x01, 0x10
+    tile_url = "https://tile.openstreetmap.org/12/{}/{}.png"
+    with Session(work, "fetch", strict=True) as s:
+        wait_for(lambda: "[Fetch] xfetch registered" in s.read_log("compositor"), 15, "xfetch to register")
+
+        # Not Maps (this script): refused, with a Denied reply (status 1).
+        url = tile_url.format(2074, 1409).encode().ljust(252, b"\0")
+        r = call(FETCH, GET, struct.pack("<I", 0) + url, timeout=3 * TIME_SCALE)
+        check(r is not None and struct.unpack("<i", r[44:48])[0] == 1,   # FetchReply.status_ == Denied
+              "a non-Maps caller wasn't refused")
+        # Not xfetch: can't become the provider.
+        send(FETCH, REGISTER)
+        wait_for(lambda: "DENIED: provider registration" in s.read_log("compositor"), 5, "the fake provider refusal")
+
+        # Seed xfetch's cache with solid-magenta tiles around Maps' start view
+        # (Paris, zoom 12 → x≈2074, y≈1409) and let Maps draw them.
+        cache = os.path.join(s.home, ".cache", "freebsdx", "fetch")
+        os.makedirs(cache, exist_ok=True)
+        seed = os.path.join(work, "magenta.png")
+        write_png(seed, 256, 256, (255, 0, 255))
+        tile = open(seed, "rb").read()
+        for x in range(2064, 2085):
+            for y in range(1400, 1420):
+                with open(os.path.join(cache, fnv1a64(tile_url.format(x, y))), "wb") as f:
+                    f.write(tile)
+        s.start("maps", [os.path.join(OUT, "maps")])
+        wait_for(lambda: "Capsicum sandbox active" in s.read_log("maps"), 15, "Maps to start sandboxed")
+        ppm = os.path.join(s.logs, "maps.ppm")
+        capture = os.path.join(OUT, "freebsdx-headless-capture")
+        def drawn():
+            subprocess.run([capture, ppm], capture_output=True, timeout=15 * TIME_SCALE)
+            return os.path.exists(ppm) and count_rgb(ppm, (255, 0, 255)) > 20000
+        wait_for(drawn, 20, "Maps to draw the fetched tiles")
+        denied = [l for l in s.read_log("compositor").splitlines() if "[Fetch] DENIED: com.freebsdx.maps" in l]
+        check(not denied, f"Maps was refused a fetch: {denied[:2]}")
+
+
 def audit_count(text):
     m = re.search(r"\[layout-audit\] (\d+) oversized", text)
     return int(m.group(1)) if m else None
@@ -616,6 +672,7 @@ SCENARIOS = {
     "consent": s_consent,
     "screen-reader": s_screen_reader,
     "shell-keyboard": s_shell_keyboard,
+    "fetch": s_fetch,
     "apps-start": s_apps_start,
     "layout-audit": s_layout_audit,
     "smoke-tools": s_smoke_tools,

@@ -16,7 +16,7 @@ repo sync
 | Script | What it checks |
 |---|---|
 | `sanitize-tests.sh` | builds the xserver + xkit test binaries in `out-asan/` and runs them under ASan + UBSan |
-| `headless-e2e.py` | end-to-end scenarios against a real headless compositor, shell and apps: file opening, the Screen Time card, the shell-trust and per-service gates, window ownership, every app starting cleanly, the layout audit (nothing laid out off-screen), and all `freebsdx-*-smoke` tools |
+| `headless-e2e.py` | end-to-end scenarios against a real headless compositor, shell and apps: file opening, the Screen Time card, the shell-trust and per-service gates, window ownership, sandboxed network fetches (Maps tiles through `com.freebsdx.Fetch`, offline from a seeded cache), every app starting cleanly, the layout audit (nothing laid out off-screen), and all `freebsdx-*-smoke` tools |
 
 ```sh
 ninja -C out                                    # build first
