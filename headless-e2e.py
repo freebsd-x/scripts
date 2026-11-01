@@ -373,6 +373,41 @@ def s_gates(work):
         wait_for(lambda: "Created session" in s.read_log("compositor"), 10, "the Terminal app's session")
 
 
+def s_consent(work):
+    """An app's first camera request asks the user; the answer is saved and
+    replayed, and a decided app isn't asked again."""
+    def run_camera(s, click):
+        before = s.read_log("compositor").count("Consent: asking")
+        p = s.start("camera", [os.path.join(OUT, "camera")])
+        if click is None:
+            time.sleep(5)
+            check(s.read_log("compositor").count("Consent: asking") == before,
+                  "a decided app was asked again")
+        else:
+            wait_for(lambda: s.read_log("compositor").count("Consent: asking") > before, 15, "the consent prompt")
+            # The card is the 460x150 layer the shell reports as its input region.
+            m = wait_for(lambda: re.findall(r"460x150@(\d+),(\d+)", s.read_log("compositor")), 10, "the consent card")
+            x, y = map(int, m[-1])
+            ptr = Pointer()
+            ptr.click(x + (425 if click == "allow" else 345), y + 89)   # Allow / Don't Allow
+            ptr.close()
+            wait_for(lambda: "replaying" in s.read_log("compositor").split("Consent: asking")[-1], 10,
+                     "the held request to be replayed")
+        os.killpg(p.pid, signal.SIGTERM)
+        p.wait()
+
+    perms = lambda s: open(os.path.join(s.home, ".freebsdx", "app-permissions")).read()
+    with Session(work, "consent-allow", strict=True) as s:
+        s.shell()
+        run_camera(s, "allow")
+        check(re.search(r"^com\.freebsdx\.camera - 1 ", perms(s), re.M), "Allow wasn't saved")
+        run_camera(s, None)                      # decided: no second prompt
+    with Session(work, "consent-deny", strict=True) as s:
+        s.shell()
+        run_camera(s, "deny")
+        check(re.search(r"^com\.freebsdx\.camera - 0 ", perms(s), re.M), "Don't Allow wasn't saved")
+
+
 def s_apps_start(work):
     """The shell and every app start with no denied calls and no crash."""
     problems = []
@@ -448,6 +483,7 @@ SCENARIOS = {
     "shell-trust": s_shell_trust,
     "surface-ownership": s_surface_ownership,
     "gates": s_gates,
+    "consent": s_consent,
     "apps-start": s_apps_start,
     "layout-audit": s_layout_audit,
     "smoke-tools": s_smoke_tools,
