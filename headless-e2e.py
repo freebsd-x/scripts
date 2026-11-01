@@ -408,6 +408,56 @@ def s_consent(work):
         check(re.search(r"^com\.freebsdx\.camera - 0 ", perms(s), re.M), "Don't Allow wasn't saved")
 
 
+class Keys:
+    """Injected key presses on one connection (KeyPress = 2; Shift = 1)."""
+
+    def __init__(self):
+        self.s = connect()
+
+    def press(self, code, shift=False):
+        for state in (1, 0):
+            payload = struct.pack(INPUT_FMT, 2, code, state, 1 if shift else 0, 0)
+            self.s.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, payload))
+            time.sleep(0.15)
+        time.sleep(0.5)
+
+    def close(self):
+        self.s.close()
+
+
+def s_screen_reader(work):
+    """With the screen reader on, Tab moves focus through Settings and each
+    control is spoken by name; Enter activates it (and Settings may save it)."""
+    log = os.path.join(work, "screen-reader.spoken")
+    # The speech log goes in the compositor's environment, so start it here
+    # rather than with Session.__enter__.
+    sess = Session(work, "screen-reader", config="a11y.screen_reader=1\n")
+    sess.start("compositor", [os.path.join(OUT, "freebsdx"), "--headless"], FBX_READER_LOG=log)
+    try:
+        wait_for(lambda: os.path.exists(SOCK), 15, "the compositor socket")
+        time.sleep(1.0)
+        sess.start("settings", [os.path.join(OUT, "settings_app")])
+        spoken = lambda: open(log).read().splitlines() if os.path.exists(log) else []
+        wait_for(lambda: "Settings, window" in spoken(), 15, "the window announcement")
+        keys = Keys()
+        keys.press(15)            # Tab → the Appearance section
+        keys.press(15)            # Tab → Dark Mode
+        keys.press(28)            # Enter → toggles it
+        keys.press(15, shift=True)
+        keys.press(15)            # back onto Dark Mode: its new state is spoken
+        keys.close()
+        time.sleep(0.5)
+        said = spoken()
+        check("Dark Mode, switch, on" in said, f"the switch wasn't spoken by name: {said}")
+        check("Dark Mode, switch, off" in said, f"Enter didn't toggle it (or it wasn't re-read): {said}")
+        check(not any(set(l.strip()) <= set("▾▸✕ ") for l in said), f"a symbol was spoken as a name: {said}")
+        theme = os.path.join(sess.home, ".freebsdx-theme")
+        check(os.path.exists(theme) and open(theme).read().startswith("0"),
+              "Settings couldn't save the theme (a sandbox gate refused it)")
+    finally:
+        sess.__exit__(None, None, None)
+
+
 def s_apps_start(work):
     """The shell and every app start with no denied calls and no crash."""
     problems = []
@@ -484,6 +534,7 @@ SCENARIOS = {
     "surface-ownership": s_surface_ownership,
     "gates": s_gates,
     "consent": s_consent,
+    "screen-reader": s_screen_reader,
     "apps-start": s_apps_start,
     "layout-audit": s_layout_audit,
     "smoke-tools": s_smoke_tools,
