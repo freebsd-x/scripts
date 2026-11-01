@@ -54,6 +54,9 @@ NOTIFICATION_POST = 1
 # a horizontal scroller).
 LAYOUT_ALLOW = {"taskmanager": 1}
 
+# Visible content laid out into a zero-size box that is expected to be.
+COLLAPSED_ALLOW = {}
+
 
 class Failed(Exception):
     pass
@@ -623,8 +626,14 @@ def audit_count(text):
     return int(m.group(1)) if m else None
 
 
+def collapsed_count(text):
+    m = re.search(r"\[layout-audit\] (\d+) collapsed", text)
+    return int(m.group(1)) if m else 0
+
+
 def s_layout_audit(work):
-    """No widget lays out absurdly large (the off-screen-content bug)."""
+    """No widget lays out absurdly large (the off-screen-content bug), and no
+    visible content is squeezed into a zero-size box (the 0 px Maps map)."""
     problems = []
     with Session(work, "layout-audit") as s:
         s.start("xshell", [os.path.join(OUT, "xshell")], FBX_LAYOUT_AUDIT="1")
@@ -632,6 +641,10 @@ def s_layout_audit(work):
         n = audit_count(s.read_log("xshell"))
         if n:
             problems.append(f"shell: {n} oversized")
+        c = collapsed_count(s.read_log("xshell"))
+        if c > COLLAPSED_ALLOW.get("xshell", 0):
+            detail = [l for l in s.read_log("xshell").splitlines() if "] collapsed " in l][:3]
+            problems.append(f"shell: {c} collapsed ({'; '.join(detail)})")
         for name, path in built_apps():
             p = s.start(name, [path], FBX_LAYOUT_AUDIT="1")
             try:
@@ -647,6 +660,10 @@ def s_layout_audit(work):
             if n and n > LAYOUT_ALLOW.get(name, 0):
                 detail = [l for l in s.read_log(name).splitlines() if "[layout-audit]" in l][:3]
                 problems.append(f"{name}: {n} oversized ({'; '.join(detail)})")
+            c = collapsed_count(s.read_log(name))
+            if c > COLLAPSED_ALLOW.get(name, 0):
+                detail = [l for l in s.read_log(name).splitlines() if "] collapsed " in l][:3]
+                problems.append(f"{name}: {c} collapsed ({'; '.join(detail)})")
     check(not problems, " | ".join(problems))
 
 
