@@ -458,6 +458,47 @@ def s_screen_reader(work):
         sess.__exit__(None, None, None)
 
 
+def s_shell_keyboard(work):
+    """Super+Space search works from the keyboard over a focused app: typing
+    goes into the search (not the app), Down + Enter opens a result, Esc
+    closes it."""
+    def procs(name):
+        r = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True)
+        return len(r.stdout.split())
+
+    def ev(c, t, a=0, b=0, ch=0):
+        c.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, struct.pack(INPUT_FMT, t, a, b, 0, ch)))
+        time.sleep(0.12)
+
+    def key(c, code, ch=""):
+        ev(c, 2, code, 1, ord(ch) if ch else 0)
+        ev(c, 2, code, 0)
+        time.sleep(0.25)
+
+    with Session(work, "shell-keyboard", strict=True) as s:
+        s.shell()
+        s.start("calculator", [os.path.join(OUT, "calculator")])
+        wait_for(lambda: procs("calculator") == 1, 10, "the calculator to start")
+        time.sleep(2)
+        c = connect()
+        ev(c, 6)                                    # Super+Space (SearchToggle)
+        time.sleep(1.0)
+        for code, ch in ((46, "c"), (30, "a"), (38, "l"), (46, "c")):
+            key(c, code, ch)
+        time.sleep(1.5)
+        key(c, 108)                                 # Down → the first result
+        key(c, 28)                                  # Enter → open it
+        wait_for(lambda: procs("calculator") == 2, 10, "the search result to open")
+        check("calc" not in s.read_log("calculator"), "the typing went to the app")
+        ev(c, 6)
+        time.sleep(1.0)
+        key(c, 1)                                   # Esc closes search
+        time.sleep(1.0)
+        c.close()
+        regions = re.findall(r"\[Shell\] Input region:.*", s.read_log("compositor"))
+        check(regions and regions[-1].endswith("(none)"), f"Esc didn't close search ({regions[-1:]})")
+
+
 def s_apps_start(work):
     """The shell and every app start with no denied calls and no crash."""
     problems = []
@@ -535,6 +576,7 @@ SCENARIOS = {
     "gates": s_gates,
     "consent": s_consent,
     "screen-reader": s_screen_reader,
+    "shell-keyboard": s_shell_keyboard,
     "apps-start": s_apps_start,
     "layout-audit": s_layout_audit,
     "smoke-tools": s_smoke_tools,
