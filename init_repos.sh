@@ -125,18 +125,6 @@ init_repo "xwayland-bridge"      "freebsdx/platform/wayland-bridge" "Initial com
 init_repo "sdk/xkit"             "freebsdx/platform/xkit"           "Initial commit: xkit UI toolkit"
 init_repo "sdk/xrender"          "freebsdx/platform/xrender"        "Initial commit: xrender GPU 2D engine"
 
-# ── Services ──────────────────────────────────────────────────────────────────
-echo ""
-echo "Services:"
-init_repo "core/services/xaudio"   "freebsdx/services/xaudio"   "Initial commit: audio service"
-init_repo "core/services/xnotify"  "freebsdx/services/xnotify"  "Initial commit: notification service"
-init_repo "core/services/xportal"  "freebsdx/services/xportal"  "Initial commit: portal service (file picker, ZFS)"
-init_repo "core/services/xnetwork" "freebsdx/services/xnetwork" "Initial commit: network service"
-init_repo "core/services/xstorage" "freebsdx/services/xstorage" "Initial commit: storage service"
-init_repo "core/services/xconfig"  "freebsdx/services/xconfig"  "Initial commit: configuration service"
-init_repo "core/services/xsystem"  "freebsdx/services/xsystem"  "Initial commit: system stats service"
-init_repo "core/services/xupdate"  "freebsdx/services/xupdate"  "Initial commit: software update service"
-
 # ── Apps ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "Apps:"
@@ -170,14 +158,6 @@ cat > "$ROOT_GITIGNORE" << 'EOF'
 # Sub-repos managed by repo tool — excluded from the build-root repo.
 include/
 core/xserver/
-core/services/xaudio/
-core/services/xnotify/
-core/services/xportal/
-core/services/xnetwork/
-core/services/xstorage/
-core/services/xconfig/
-core/services/xsystem/
-core/services/xupdate/
 core/xshell/
 xwayland-bridge/
 sdk/xkit/
@@ -242,14 +222,6 @@ SHA_XSERVER=$(head_sha "core/xserver")
 SHA_BRIDGE=$(head_sha "xwayland-bridge")
 SHA_XKIT=$(head_sha "sdk/xkit")
 SHA_XRENDER=$(head_sha "sdk/xrender")
-SHA_XAUDIO=$(head_sha "core/services/xaudio")
-SHA_XNOTIFY=$(head_sha "core/services/xnotify")
-SHA_XPORTAL=$(head_sha "core/services/xportal")
-SHA_XNETWORK=$(head_sha "core/services/xnetwork")
-SHA_XSTORAGE=$(head_sha "core/services/xstorage")
-SHA_XCONFIG=$(head_sha "core/services/xconfig")
-SHA_XSYSTEM=$(head_sha "core/services/xsystem")
-SHA_XUPDATE=$(head_sha "core/services/xupdate")
 SHA_TERMINAL=$(head_sha "apps/Terminal.xapp")
 SHA_TEXTEDITOR=$(head_sha "apps/TextEditor.xapp")
 SHA_FILES=$(head_sha "apps/Files.xapp")
@@ -283,14 +255,6 @@ cat > "$ROOT/manifest/default.xml" << EOF
   <project name="freebsdx/platform/xshell"         path="core/xshell"     revision="${SHA_XSHELL}" />
 
   <!-- ── Services ─────────────────────────────────────────────────────── -->
-  <project name="freebsdx/services/xaudio"   path="core/services/xaudio"   revision="${SHA_XAUDIO}" />
-  <project name="freebsdx/services/xnotify"  path="core/services/xnotify"  revision="${SHA_XNOTIFY}" />
-  <project name="freebsdx/services/xportal"  path="core/services/xportal"  revision="${SHA_XPORTAL}" />
-  <project name="freebsdx/services/xnetwork" path="core/services/xnetwork" revision="${SHA_XNETWORK}" />
-  <project name="freebsdx/services/xstorage" path="core/services/xstorage" revision="${SHA_XSTORAGE}" />
-  <project name="freebsdx/services/xconfig"  path="core/services/xconfig"  revision="${SHA_XCONFIG}" />
-  <project name="freebsdx/services/xsystem"  path="core/services/xsystem"  revision="${SHA_XSYSTEM}" />
-  <project name="freebsdx/services/xupdate"  path="core/services/xupdate"  revision="${SHA_XUPDATE}" />
 
   <!-- ── Apps ──────────────────────────────────────────────────────────── -->
   <project name="freebsdx/apps/Terminal"   path="apps/Terminal.xapp"   revision="${SHA_TERMINAL}" />
