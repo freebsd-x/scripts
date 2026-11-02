@@ -57,6 +57,9 @@ LAYOUT_ALLOW = {"taskmanager": 1}
 # Visible content laid out into a zero-size box that is expected to be.
 COLLAPSED_ALLOW = {}
 
+# Low-contrast texts that are expected, by (app, theme).
+CONTRAST_ALLOW = {}
+
 
 class Failed(Exception):
     pass
@@ -667,6 +670,44 @@ def s_layout_audit(work):
     check(not problems, " | ".join(problems))
 
 
+def low_contrast(text):
+    m = re.search(r"\[layout-audit\] (\d+) low-contrast", text)
+    return int(m.group(1)) if m else 0
+
+
+THEME_SET = 0x02
+
+
+def s_contrast(work):
+    """Text is readable in both themes: the layout audit's contrast check
+    (WCAG ratio >= 3:1 against what is painted behind it) passes for the
+    shell and every app, dark and light."""
+    problems = []
+    for theme, dark in (("dark", 1), ("light", 0)):
+        with Session(work, f"contrast-{theme}") as s:
+            send("com.freebsdx.Theme", THEME_SET, struct.pack("<II", dark, 0))
+            time.sleep(0.5)
+            targets = [("xshell", os.path.join(OUT, "xshell"))] + built_apps()
+            for name, path in targets:
+                p = s.start(name, [path], FBX_LAYOUT_AUDIT="1")
+                try:
+                    wait_for(lambda: audit_count(s.read_log(name)) is not None, 20 if name == "xshell" else 8,
+                             f"{name}'s layout audit")
+                except Failed:
+                    pass   # paints no frames (GPU demo): nothing to audit
+                if name != "xshell":   # the shell stays up: apps' audits are of their own windows
+                    try:
+                        os.killpg(p.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    p.wait()
+                n = low_contrast(s.read_log(name))
+                if n > CONTRAST_ALLOW.get((name, theme), 0):
+                    detail = [l.split("] ", 1)[1] for l in s.read_log(name).splitlines() if "] low-contrast " in l][:2]
+                    problems.append(f"{name} ({theme}): {n} ({'; '.join(detail)})")
+    check(not problems, " | ".join(problems))
+
+
 def s_smoke_tools(work):
     """Every freebsdx-*-smoke tool passes against a fresh compositor."""
     tools = sorted(f for f in os.listdir(OUT) if f.startswith("freebsdx-") and f.endswith("-smoke"))
@@ -692,6 +733,7 @@ SCENARIOS = {
     "fetch": s_fetch,
     "apps-start": s_apps_start,
     "layout-audit": s_layout_audit,
+    "contrast": s_contrast,
     "smoke-tools": s_smoke_tools,
 }
 
