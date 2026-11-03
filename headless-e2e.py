@@ -63,7 +63,7 @@ COLLAPSED_ALLOW = {}
 # layout/contrast audits (they launch the same apps again; their findings are
 # about layout, which the normal run checks) and smoke-tools (~3.5 min).
 # --asan --all still runs everything.
-ASAN_DEFAULT = ["file-open", "shell-trust", "gates", "consent", "shell-keyboard", "fetch", "apps-start"]
+ASAN_DEFAULT = ["file-open", "shell-trust", "gates", "consent", "shell-keyboard", "fetch", "apps-start", "app-tasks"]
 
 # Low-contrast texts that are expected, by (app, theme).
 CONTRAST_ALLOW = {}
@@ -716,6 +716,111 @@ def s_contrast(work):
     check(not problems, " | ".join(problems))
 
 
+class AppDriver:
+    """Drives one app the way a user would — keys on the keyboard — and reads
+    back what it shows: FBX_UI_DUMP=1 makes an xkit app print its visible text
+    (labels and fields, with positions) when sent SIGUSR1."""
+    KEYCODE = {**{str(d): (11 if d == 0 else d + 1) for d in range(10)},
+               "+": 13, "=": 13, "-": 12, "*": 9, "/": 53, ".": 52, " ": 57}
+
+    def __init__(self, session, name):
+        self.s, self.name = session, name
+        self.p = session.start(name, [os.path.join(OUT, name)], FBX_UI_DUMP="1")
+        wait_for(lambda: "Painting frame" in session.read_log(name), 15, f"{name} to paint")
+        time.sleep(1.0 * TIME_SCALE)
+        self.c = connect()
+
+    def key(self, code, ch="", shift=False):
+        for state in (1, 0):
+            payload = struct.pack(INPUT_FMT, 2, code, state, 1 if shift else 0, ord(ch) if ch else 0)
+            self.c.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, payload))
+            time.sleep(0.06 * TIME_SCALE)
+
+    def type(self, text):
+        for ch in text:
+            self.key(self.KEYCODE.get(ch.lower(), 30 if ch.isalpha() else 57), ch, shift=ch in "+*")
+        time.sleep(0.3 * TIME_SCALE)
+
+    def tab(self):   self.key(15)
+    def enter(self): self.key(28); time.sleep(0.3 * TIME_SCALE)
+
+    def screen(self):
+        """The app's visible texts as [(x, y, text)]."""
+        before = self.s.read_log(self.name).count("[ui-dump] end")
+        os.kill(self.p.pid, signal.SIGUSR1)
+        wait_for(lambda: self.s.read_log(self.name).count("[ui-dump] end") > before, 5, f"{self.name}'s screen")
+        block = self.s.read_log(self.name).rsplit("[ui-dump] begin", 1)[1].split("[ui-dump] end")[0]
+        out = []
+        for line in block.splitlines():
+            m = re.match(r"\[ui-dump\] (-?\d+),(-?\d+) (.*)", line)
+            if m:
+                out.append((int(m.group(1)), int(m.group(2)), m.group(3)))
+        return out
+
+    def texts(self):
+        return [t for _, _, t in self.screen()]
+
+    def close(self):
+        self.c.close()
+        try:
+            os.killpg(self.p.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        self.p.wait()
+
+
+def s_app_tasks(work):
+    """Apps do their job, driven from the keyboard and checked on screen:
+    Calculator computes (typing previews, Enter commits once and chains), Text
+    Editor types into the document, Notes' "+ New Note" and Contacts' "+ Add
+    Contact" let you type straight away."""
+    problems = []
+    with Session(work, "app-tasks") as s:
+        calc = AppDriver(s, "calculator")
+        calc.type("12+30")
+        t = calc.texts()
+        if "42" not in t:
+            problems.append(f"calculator: no live result for 12+30 ({t[:6]})")
+        if any("=" in x and x != "=" for x in t):
+            problems.append("calculator: typing added history entries")
+        calc.enter()
+        t = calc.texts()
+        if t.count("12+30 = 42") != 1:
+            problems.append(f"calculator: history after Enter is {[x for x in t if ' = ' in x]}")
+        calc.type("*2")
+        calc.enter()
+        t = calc.texts()
+        if "42*2 = 84" not in t:
+            problems.append(f"calculator: the result didn't chain into the next expression ({[x for x in t if ' = ' in x]})")
+        calc.close()
+
+        ed = AppDriver(s, "texteditor")
+        ed.type("hello freebsd")
+        time.sleep(1.5 * TIME_SCALE)   # the wrap fed back on itself over frames
+        rows = ed.screen()
+        body = [t for x, y, t in rows if y > 40]          # below the File: toolbar
+        if "hello freebsd" not in body:
+            problems.append(f"texteditor: typing didn't reach the document as one line ({body[:6]})")
+        ed.close()
+
+        notes = AppDriver(s, "notes")
+        notes.tab(); notes.tab(); notes.enter()           # focus "+ New Note", press it
+        notes.type("Buy milk")
+        t = notes.texts()
+        if "Buy milk" not in t or "Search…" not in t:
+            problems.append(f"notes: a new note's title didn't take the typing ({t[:10]})")
+        notes.close()
+
+        contacts = AppDriver(s, "contacts")
+        contacts.tab(); contacts.tab(); contacts.enter()   # "+ Add Contact"
+        contacts.type("Ada")
+        t = contacts.texts()
+        if "Ada" not in t or "Search contacts…" not in t:
+            problems.append(f"contacts: the new-contact form didn't take the typing ({t[:10]})")
+        contacts.close()
+    check(not problems, " | ".join(problems))
+
+
 def s_smoke_tools(work):
     """Every freebsdx-*-smoke tool passes against a fresh compositor."""
     tools = sorted(f for f in os.listdir(OUT) if f.startswith("freebsdx-") and f.endswith("-smoke"))
@@ -742,6 +847,7 @@ SCENARIOS = {
     "apps-start": s_apps_start,
     "layout-audit": s_layout_audit,
     "contrast": s_contrast,
+    "app-tasks": s_app_tasks,
     "smoke-tools": s_smoke_tools,
 }
 
