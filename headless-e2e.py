@@ -57,6 +57,14 @@ LAYOUT_ALLOW = {"taskmanager": 1}
 # Visible content laid out into a zero-size box that is expected to be.
 COLLAPSED_ALLOW = {}
 
+# What --asan runs by default. Sanitized processes run 3-5x slower, so the full
+# suite took ~14 min; these keep what a sanitizer adds: every app sanitized
+# (apps-start) and the compositor paths each scenario drives. Left out: the
+# layout/contrast audits (they launch the same apps again; their findings are
+# about layout, which the normal run checks) and smoke-tools (~3.5 min).
+# --asan --all still runs everything.
+ASAN_DEFAULT = ["file-open", "shell-trust", "gates", "consent", "shell-keyboard", "fetch", "apps-start"]
+
 # Low-contrast texts that are expected, by (app, theme).
 CONTRAST_ALLOW = {}
 
@@ -788,7 +796,9 @@ def main():
     ap.add_argument("--shots", metavar="DIR", help="also capture every app into DIR")
     ap.add_argument("--keep", action="store_true", help="keep the logs and scratch homes")
     ap.add_argument("--asan", action="store_true",
-                    help="run the out-asan/ (ASan+UBSan) binaries; any sanitizer report fails the scenario")
+                    help="run the out-asan/ (ASan+UBSan) binaries; any sanitizer report fails the scenario. "
+                         "Without named scenarios it runs the sanitizer set (ASAN_DEFAULT, ~5 min), not all")
+    ap.add_argument("--all", action="store_true", help="with --asan: every scenario (~14 min)")
     args = ap.parse_args()
     global OUT, TIME_SCALE
     if args.asan:
@@ -820,7 +830,7 @@ def main():
     work = tempfile.mkdtemp(prefix="fbx-e2e.")
     scanned = set()
     failed = 0
-    names = args.scenarios or list(SCENARIOS)
+    names = args.scenarios or (ASAN_DEFAULT if args.asan and not args.all else list(SCENARIOS))
     for name in names:
         t0 = time.time()
         try:
