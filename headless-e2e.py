@@ -30,6 +30,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zlib
 
@@ -63,7 +64,7 @@ COLLAPSED_ALLOW = {}
 # layout/contrast audits (they launch the same apps again; their findings are
 # about layout, which the normal run checks) and smoke-tools (~3.5 min).
 # --asan --all still runs everything.
-ASAN_DEFAULT = ["file-open", "shell-trust", "gates", "consent", "shell-keyboard", "fetch", "apps-start", "app-tasks"]
+ASAN_DEFAULT = ["file-open", "persistence", "shell-trust", "gates", "consent", "shell-keyboard", "fetch", "apps-start", "app-tasks"]
 
 # Low-contrast texts that are expected, by (app, theme).
 CONTRAST_ALLOW = {}
@@ -508,6 +509,25 @@ def s_screen_reader(work):
         sess.__exit__(None, None, None)
 
 
+def s_window_chrome(work):
+    """Window chrome is drawn in its own colours (the solid shader once read each
+    colour 8 bytes late, painting a bright green band across every title bar)."""
+    with Session(work, "window-chrome") as s:
+        calc = AppDriver(s, "calculator")
+        ppm = os.path.join(s.logs, "chrome.ppm")
+        subprocess.run([os.path.join(OUT, "freebsdx-headless-capture"), ppm], capture_output=True, timeout=15 * TIME_SCALE)
+        with open(ppm, "rb") as f:
+            _, dims, _, rgb = f.read().split(b"\n", 3)
+        w, h = map(int, dims.split())
+        green = 0
+        for i in range(0, w * h * 3, 3):
+            if rgb[i + 1] > 180 and rgb[i] < 110 and rgb[i + 2] < 110:
+                green += 1
+        calc.close()
+        # The maximize button is green too, but only about 110 pixels of it.
+        check(green < 2000, f"{green} bright green pixels on screen")
+
+
 def s_shell_keyboard(work):
     """Super+Space search works from the keyboard over a focused app: typing
     goes into the search (not the app), Down + Enter opens a result, Esc
@@ -900,6 +920,276 @@ def s_app_tasks(work):
     check(not problems, " | ".join(problems))
 
 
+class Watcher:
+    """A plain app-level connection that collects what it's sent, to prove what
+    other apps do NOT get to see."""
+
+    def __init__(self):
+        self.s = connect()
+        self.s.send(xbus_msg("com.freebsdx.Notes", 5, struct.pack("<I", 0).ljust(256, b"\0")))   # register
+        self.seen = []
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+
+    def _run(self):
+        try:
+            while True:
+                d = self.s.recv(4096)
+                if not d:
+                    return
+                self.seen.append(d)
+        except OSError:
+            return
+
+    def saw(self, service):
+        tag = service.encode()
+        return [d for d in self.seen if len(d) >= 300 and d[8:40].split(b"\0")[0] == tag]
+
+    def close(self):
+        self.s.shutdown(socket.SHUT_RDWR)
+        self.s.close()
+
+
+def s_replies(work):
+    """Requests get answered: a service's reply carries the request's id (a client
+    waits on that id, and a reply without it never reaches the waiting code), one
+    reply per request, and a paged list answers the page asked for."""
+    problems = []
+
+    def one(service, opcode, payload=b"", name=""):
+        s = connect()
+        tid = 777
+        s.send(xbus_msg(service, opcode, payload.ljust(256, b"\0"), tid))
+        s.settimeout(3.0 * TIME_SCALE)
+        reply = None
+        try:
+            while reply is None:
+                d = s.recv(4096)
+                if len(d) >= 300 and d[8:40].split(b"\0")[0] == service.encode():
+                    got = struct.unpack("<I", d[4:8])[0]
+                    if got == tid:
+                        reply = d
+                    elif got != 0:
+                        problems.append(f"{name}: reply with a stranger's id {got}")
+            s.settimeout(0.4 * TIME_SCALE)
+            while True:
+                d = s.recv(4096)
+                if len(d) >= 300 and struct.unpack("<I", d[4:8])[0] == tid:
+                    problems.append(f"{name}: a second reply to one request")
+        except socket.timeout:
+            pass
+        s.close()
+        if reply is None:
+            problems.append(f"{name}: no reply carrying the request's id")
+        return reply[44:] if reply else b""
+
+    with Session(work, "replies"):
+        B, N, W, D, A = ("com.freebsdx.Bookmarks", "com.freebsdx.Notes", "com.freebsdx.Weather",
+                         "com.freebsdx.Disk", "com.freebsdx.Archive")
+        for title, url in ((b"One", b"http://one/"), (b"Two", b"http://two/")):
+            one(B, 1, title.ljust(60, b"\0") + url, "bookmarks add")
+        p0 = one(B, 3, struct.pack("<I", 0), "bookmarks list")
+        p1 = one(B, 3, struct.pack("<I", 1), "bookmarks list page 1")
+        p2 = one(B, 3, struct.pack("<I", 2), "bookmarks list past the end")
+        def bm(p):
+            return struct.unpack("<4I", p[:16]) + (p[16:76].split(b"\0")[0],)
+        if bm(p0) != (0, 2, 1, 1, b"One") or bm(p1) != (1, 2, 1, 0, b"Two") or bm(p2)[2] != 0:
+            problems.append(f"bookmarks: pages read {bm(p0)} {bm(p1)} {bm(p2)}")
+
+        one(W, 1, b"", "weather current")
+        one(W, 2, b"", "weather forecast")
+        one(W, 2, struct.pack("<I", 1), "weather forecast page 1")
+
+        for op, what in ((1, "disks"), (7, "pools")):     # ListDisks, ListZpools
+            page = one(D, op, struct.pack("<I", 0), what)
+            page_no, more, total = struct.unpack("<3I", page[:12]) if page else (0, 0, 0)
+            if total > 1 and not more:
+                problems.append(f"disk {what}: page 0 of {total} says there is no more")
+            if total >= 1:
+                page = one(D, op, struct.pack("<I", total - 1), f"{what} last page")
+                if struct.unpack("<2I", page[:8]) != (total - 1, 0):
+                    problems.append(f"disk {what}: the last page reads {struct.unpack('<2I', page[:8])}")
+        one(D, 2, b"nosuch!device".ljust(32, b"\0"), "partitions of a bad name")
+
+        one(N, 5, struct.pack("<I", 0), "notes list")
+        one(A, 1, struct.pack("<II", 0, 0) + b"/nonexistent.zip", "archive list of a missing file")
+    check(not problems, " | ".join(problems))
+
+
+def s_persistence(work):
+    """What you save is still there: Text Editor saves and opens through the
+    powerbox (the user picks in the shell, the app gets one descriptor; apps can
+    neither answer the picker nor see what was picked), and notes and contacts
+    survive the compositor restarting."""
+    problems = []
+
+    def ctrl(d, code):
+        d.key(code, ctrl=True)
+        time.sleep(1.2 * TIME_SCALE)
+
+    def body(path):
+        with open(path) as f:
+            return f.read()
+
+    def wait_body(path, want, what):
+        try:
+            wait_for(lambda: os.path.exists(path) and body(path) == want, 6, what)
+        except Failed:
+            problems.append(f"{what}: file holds {body(path) if os.path.exists(path) else None!r}, not {want!r}")
+
+    # After Ctrl+O the picker is focused on Back: Tab * (index + 1) reaches a file,
+    # Enter selects it, Enter again opens it.
+    def pick(d, index):
+        for _ in range(index + 1):
+            d.tab()
+        d.enter()
+        d.enter()
+        time.sleep(1.0 * TIME_SCALE)
+
+    with Session(work, "persistence") as s:
+        s.shell()
+        watcher = Watcher()
+        note = os.path.join(s.home, "note.txt")
+
+        ed = AppDriver(s, "texteditor")
+        ed.type("first draft")
+        ctrl(ed, 31)                                  # Ctrl+S: no file yet, so Save As
+        ed.type("note.txt")
+        ed.enter()
+        wait_body(note, "first draft", "save as")
+        t = ed.texts()
+        if "Saved" not in t or "note.txt" not in t:
+            problems.append(f"editor: no 'Saved' / name after saving ({t[:6]})")
+        ed.type(" more")
+        ctrl(ed, 31)                                  # Ctrl+S again: no second asking
+        wait_body(note, "first draft more", "save")
+        ctrl(ed, 31)
+        ed.close()
+
+        # A file that gets shorter must lose its old tail; the fixtures for the
+        # cases below (sorted: fifo, note.txt, zlocked.txt).
+        locked = os.path.join(s.home, "zlocked.txt")
+        with open(locked, "w") as f:
+            f.write("locked text")
+        os.chmod(locked, 0o444)
+        os.mkfifo(os.path.join(s.home, "fifo"))
+
+        ed = AppDriver(s, "texteditor")
+        ctrl(ed, 24)                                  # Ctrl+O
+        pick(ed, 1)
+        t = ed.texts()
+        if "first draft more" not in t or "note.txt" not in t:
+            problems.append(f"editor: opening note.txt shows {t[:6]}")
+        ed.type("!")
+        ctrl(ed, 31)
+        wait_body(note, "first draft more!", "save to an opened file")
+
+        ctrl(ed, 24)                                  # Esc cancels: nothing changes
+        ed.key(1)
+        time.sleep(0.8 * TIME_SCALE)
+        if "first draft more!" not in ed.texts():
+            problems.append("editor: cancelling the picker changed the document")
+
+        ctrl(ed, 24)                                  # a FIFO: refused, no hang
+        pick(ed, 0)
+        t = ed.texts()
+        if not any("Not a regular file" in x for x in t):
+            problems.append(f"editor: opening a FIFO said {t[:6]}")
+
+        # An app can't answer the picker for the user.
+        ctrl(ed, 24)
+        forger = connect()
+        for rid in range(1, 16):
+            payload = struct.pack("<4I", 5, rid, 0, 1) + b"/etc/passwd".ljust(240, b"\0")
+            forger.send(xbus_msg("com.freebsdx.FileChooser", 5, payload))
+        time.sleep(0.5 * TIME_SCALE)
+        forger.close()
+        if "root:" in " ".join(ed.texts()):
+            problems.append("editor: a forged Respond handed over /etc/passwd")
+        if "DENIED: com.freebsdx.FileChooser" not in s.read_log("compositor"):
+            problems.append("a forged Respond wasn't refused")
+        ed.key(1)
+        time.sleep(0.8 * TIME_SCALE)
+
+        # Saving over another file takes a second press.
+        ctrl(ed, 24)
+        pick(ed, 1)                                   # back to note.txt
+        ed.key(31, shift=True, ctrl=True)
+        time.sleep(1.2 * TIME_SCALE)
+        other = os.path.join(s.home, "other.txt")
+        with open(other, "w") as f:
+            f.write("keep me")
+        ed.type("other.txt")
+        ed.enter()
+        time.sleep(1.0 * TIME_SCALE)
+        if body(other) != "keep me":
+            problems.append("save as: replaced an existing file without asking")
+        ed.enter()
+        wait_body(other, "first draft more!", "save as, replace confirmed")
+        ed.close()
+
+        # A read-only file opens, says so, and saving asks where.
+        ed = AppDriver(s, "texteditor")
+        ctrl(ed, 24)
+        pick(ed, 3)                                   # fifo, note, other, zlocked
+        t = ed.texts()
+        if "locked text" not in t or not any("read-only" in x for x in t):
+            problems.append(f"editor: a read-only file shows {t[:6]}")
+        ctrl(ed, 31)                                  # opens the picker instead
+        ed.key(1)
+        time.sleep(0.8 * TIME_SCALE)
+        if body(locked) != "locked text":
+            problems.append("a read-only file was changed")
+        ed.close()
+
+        time.sleep(0.5 * TIME_SCALE)
+        leaked = watcher.saw("com.freebsdx.FileChooser")
+        if leaked:
+            problems.append(f"another app saw {len(leaked)} file chooser message(s)")
+        watcher.close()
+
+        notes = AppDriver(s, "notes")
+        notes.tab(); notes.tab(); notes.enter()       # "+ New Note": the title has focus
+        notes.type("Buy milk")
+        notes.tab()                                   # the body
+        notes.type("abc")
+        t = notes.texts()
+        if "3 / 163 chars" not in t:
+            problems.append(f"notes: the counter doesn't follow typing ({t})")
+        notes.tab(shift=True); notes.tab(shift=True)  # title, then Save
+        notes.enter()
+        time.sleep(1.0 * TIME_SCALE)
+        t = notes.texts()
+        if t.count("Buy milk") < 1:
+            problems.append(f"notes: the saved note isn't listed ({t[:8]})")
+        notes.close()
+
+        contacts = AppDriver(s, "contacts")
+        contacts.tab(); contacts.tab(); contacts.enter()
+        contacts.type("Ada")
+        for _ in range(6):                            # the other fields, then Save
+            contacts.tab()
+        contacts.enter()
+        time.sleep(1.0 * TIME_SCALE)
+        if "Ada" not in " ".join(contacts.texts()):
+            problems.append("contacts: the saved contact isn't shown")
+        contacts.close()
+
+    with Session(work, "persistence") as s:           # the compositor restarted
+        notes = AppDriver(s, "notes")
+        t = notes.texts()
+        rows = [x for x in t if x == "Buy milk"]
+        if len(rows) != 1:
+            problems.append(f"notes after restart: 'Buy milk' listed {len(rows)} times ({t[:8]})")
+        notes.close()
+        contacts = AppDriver(s, "contacts")
+        t = contacts.texts()
+        if not any("Ada" in x for x in t):
+            problems.append(f"contacts after restart: 'Ada' is gone ({t[:8]})")
+        contacts.close()
+    check(not problems, " | ".join(problems))
+
+
 def s_smoke_tools(work):
     """Every freebsdx-*-smoke tool passes against a fresh compositor."""
     tools = sorted(f for f in os.listdir(OUT) if f.startswith("freebsdx-") and f.endswith("-smoke"))
@@ -909,12 +1199,16 @@ def s_smoke_tools(work):
         with Session(work, "smoke-" + t) as s:
             r = subprocess.run([os.path.join(OUT, t)], cwd=ROOT, env=s.env(), capture_output=True, timeout=60)
             if r.returncode != 0:
-                failed.append(t)
+                said = (r.stdout + r.stderr).decode(errors="replace").strip().splitlines()[-3:]
+                failed.append(f"{t} (exit {r.returncode}): {' / '.join(said)}")
     check(not failed, "failed: " + ", ".join(failed))
 
 
 SCENARIOS = {
     "file-open": s_file_open,
+    "replies": s_replies,
+    "window-chrome": s_window_chrome,
+    "persistence": s_persistence,
     "times-up": s_times_up,
     "shell-trust": s_shell_trust,
     "surface-ownership": s_surface_ownership,
