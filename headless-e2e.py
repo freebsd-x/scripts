@@ -21,6 +21,8 @@ Standard library only. Uses netpbm (pnmtopng, pnmcut, pnmscale, pnmcat) for
 """
 
 import argparse
+import wave
+import ssl
 import os
 import re
 import shutil
@@ -257,7 +259,8 @@ class Session:
         self.procs = []
 
     def env(self, **extra):
-        e = dict(os.environ, HOME=self.home)
+        # FBX_NO_AUDIO: nothing here should play through the real sound card.
+        e = dict(os.environ, HOME=self.home, FBX_NO_AUDIO="1")
         e.update(extra)
         return e
 
@@ -326,8 +329,22 @@ def procs_running(binary_path):
 
 # ── Scenarios ─────────────────────────────────────────────────────────────────
 
+def on_screen(s, rgb, tag):
+    """How many (sampled) pixels of the screen are this colour, give or take a little."""
+    ppm = os.path.join(s.logs, tag + ".ppm")
+    subprocess.run([os.path.join(OUT, "freebsdx-headless-capture"), ppm], capture_output=True, timeout=15 * TIME_SCALE)
+    if not os.path.exists(ppm):
+        return 0
+    parts = open(ppm, "rb").read().split(b"\n", 3)
+    pix, near = parts[3], 0
+    for i in range(0, len(pix) - 2, 3 * 4):
+        if abs(pix[i] - rgb[0]) < 12 and abs(pix[i + 1] - rgb[1]) < 12 and abs(pix[i + 2] - rgb[2]) < 12:
+            near += 1
+    return near
+
+
 def s_file_open(work):
-    """Opening a file launches its app; a second file reuses the open window."""
+    """Opening a file launches its app and shows it; a second file gets a window of its own."""
     a, b = os.path.join(work, "first.png"), os.path.join(work, "second.png")
     write_png(a, 64, 64, (220, 40, 40))
     write_png(b, 64, 64, (40, 200, 40))
@@ -337,9 +354,11 @@ def s_file_open(work):
         launch_with_file("com.freebsdx.imageviewer", a)
         wait_for(lambda: "Image Viewer — first.png" in s.read_log("compositor"), 15, "the viewer to open first.png")
         check(procs_running(viewer) == 1, "expected one Image Viewer")
+        wait_for(lambda: on_screen(s, (220, 40, 40), "first") > 5000, 10, "first.png's pixels on screen")
+        # A running, sandboxed viewer can't open a path it's told: its own window.
         launch_with_file("com.freebsdx.imageviewer", b)
-        wait_for(lambda: "Image Viewer — second.png" in s.read_log("compositor"), 10, "the open viewer to show second.png")
-        check(procs_running(viewer) == 1, f"a second file started another viewer ({procs_running(viewer)} running)")
+        wait_for(lambda: "Image Viewer — second.png" in s.read_log("compositor"), 15, "second.png to open")
+        wait_for(lambda: on_screen(s, (40, 200, 40), "second") > 5000, 10, "second.png's pixels on screen")
 
 
 def s_times_up(work):
@@ -743,9 +762,9 @@ class AppDriver:
     KEYCODE = {**{str(d): (11 if d == 0 else d + 1) for d in range(10)},
                "+": 13, "=": 13, "-": 12, "*": 9, "/": 53, ".": 52, " ": 57}
 
-    def __init__(self, session, name):
+    def __init__(self, session, name, *args):
         self.s, self.name = session, name
-        self.p = session.start(name, [os.path.join(OUT, name)], FBX_UI_DUMP="1")
+        self.p = session.start(name, [os.path.join(OUT, name), *args], FBX_UI_DUMP="1")
         wait_for(lambda: "Painting frame" in session.read_log(name), 15, f"{name} to paint")
         time.sleep(1.0 * TIME_SCALE)
         self.c = connect()
@@ -1016,6 +1035,417 @@ def s_replies(work):
     check(not problems, " | ".join(problems))
 
 
+def s_media(work):
+    """What the media apps open really shows and plays, opened at launch and,
+    inside the sandbox, through the picker: right colours, moving time, readable
+    errors."""
+    problems = []
+    RED, GREEN = (224, 32, 32), (40, 200, 40)
+
+    def pick(d, index, again=False):
+        # Open… is first in the tab order (and keeps the focus after a pick); in the
+        # picker, Tab * (index + 1) reaches a file, Enter selects it, Enter opens it.
+        if not again:
+            d.tab()
+        d.enter()
+        time.sleep(1.2 * TIME_SCALE)
+        for _ in range(index + 1):
+            d.tab()
+        d.enter()
+        d.enter()
+        time.sleep(1.2 * TIME_SCALE)
+
+    def clock(d):
+        # "m:ss" values on screen, each as seconds.
+        return [int(m) * 60 + int(ss) for t in d.texts() for m, ss in re.findall(r"(\d+):(\d\d)", t)]
+
+    def advancing(d, what, longest):
+        # Its position, the shortest time shown once a total is on screen, moves on.
+        start = min(clock(d), default=None)
+        time.sleep(3.0 * TIME_SCALE)
+        now = min(clock(d), default=None)
+        if start is None or now is None or now <= start or now >= longest:
+            problems.append(f"{what}: the time doesn't advance ({start} then {now}): {d.texts()[:10]}")
+
+    with Session(work, "media") as s:
+        s.shell()
+        home = s.home
+        def fixture(name):
+            return os.path.join(home, name)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=0xE02020:s=320x240:d=0.1",
+                        "-frames:v", "1", fixture("a_red.jpg")], check=True)
+        write_png(fixture("b_green.png"), 64, 64, GREEN)
+        with open(fixture("c_junk.jpg"), "wb") as f:
+            f.write(b"this is not a picture")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=duration=60:size=160x120:rate=5",
+                        "-pix_fmt", "yuv420p", fixture("clip.mp4")], check=True)
+        with open(fixture("doc.pdf"), "wb") as f:
+            f.write(b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+                    b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 400 300]>>endobj\ntrailer<</Root 1 0 R>>\n")
+        with wave.open(fixture("tone.wav"), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(8000)
+            w.writeframes(b"\0\0" * 8000 * 60)
+
+        # Image Viewer, started on a JPEG: the picture, then its folder through
+        # what it was allowed to keep.
+        d = AppDriver(s, "imageviewer", "--open", fixture("a_red.jpg"))
+        if on_screen(s, RED, "jpeg") < 5000:
+            problems.append("viewer: a red JPEG isn't red on screen")
+        if on_screen(s, (RED[2], RED[1], RED[0]), "jpeg") > 500:
+            problems.append("viewer: red and blue are swapped")
+        d.tab(); d.tab(); d.tab()   # Open…, ←, →
+        d.enter()
+        time.sleep(1.0 * TIME_SCALE)
+        if "b_green.png" not in d.texts() or on_screen(s, GREEN, "next") < 5000:
+            problems.append(f"viewer: next file in the folder doesn't show: {d.texts()[:6]}")
+        d.enter()
+        time.sleep(1.0 * TIME_SCALE)
+        if not any("Can't show c_junk.jpg" in t for t in d.texts()):
+            problems.append(f"viewer: a damaged file gives no message: {d.texts()[:12]}")
+        d.close()
+
+        # Started empty: only the picker can give it anything.
+        d = AppDriver(s, "imageviewer")
+        pick(d, 1)
+        if "b_green.png" not in d.texts() or on_screen(s, GREEN, "picked") < 5000:
+            problems.append(f"viewer: a picked PNG doesn't show: {d.texts()[:6]}")
+        pick(d, 0, again=True)
+        if "a_red.jpg" not in d.texts() or on_screen(s, RED, "picked2") < 5000:
+            problems.append(f"viewer: a picked JPEG doesn't show: {d.texts()[:6]}")
+        d.close()
+
+        # Music: from the command line and added in the sandbox.
+        d = AppDriver(s, "musicplayer", "--open", fixture("tone.wav"))
+        advancing(d, "music from the command line", 60)
+        d.close()
+        d = AppDriver(s, "musicplayer")
+        pick(d, 5)
+        if not any("1 track" in t for t in d.texts()):
+            problems.append(f"music: Add Files didn't add: {d.texts()[:8]}")
+        advancing(d, "music added through the picker", 60)
+        d.close()
+
+        # Video.
+        d = AppDriver(s, "videoplayer", "--open", fixture("clip.mp4"))
+        advancing(d, "video from the command line", 60)
+        d.close()
+        d = AppDriver(s, "videoplayer")
+        pick(d, 3)
+        if "clip.mp4" not in d.texts():
+            problems.append(f"video: a picked file doesn't open: {d.texts()[:6]}")
+        advancing(d, "video opened through the picker", 60)
+        d.close()
+
+        # PDF: opened in the sandbox. A blank page, drawn white, in a window of grey.
+        d = AppDriver(s, "pdfviewer")
+        pick(d, 4)
+        if "doc.pdf" not in d.texts() or "1 / 1" not in d.texts():
+            problems.append(f"pdf: a picked file doesn't open: {d.texts()[:6]}")
+        if on_screen(s, (255, 255, 255), "pdf") < 3000:
+            problems.append("pdf: no page on screen")
+        pick(d, 2, again=True)
+        if "doc.pdf" in d.texts() or not any("isn't a readable PDF" in t for t in d.texts()):
+            problems.append(f"pdf: a bad file gives no message: {d.texts()[:6]}")
+        d.close()
+
+    check(not problems, "; ".join(problems))
+
+
+def s_sandbox_audit(work):
+    """No app is refused a file by its sandbox. Every path an app opens past start-up
+    fails, usually with nothing on screen to say so: this reads the kernel's list."""
+    # Mesa writing to its shader cache: an optimisation, and it copes.
+    harmless = ("mesa_shader_cache",)
+    with Session(work, "sandbox-audit") as s:
+        media = os.path.join(s.home, "m")
+        os.makedirs(media)
+        png, wav = os.path.join(media, "p.png"), os.path.join(media, "t.wav")
+        write_png(png, 64, 64, (40, 200, 40))
+        with wave.open(wav, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(8000)
+            w.writeframes(b"\0\0" * 8000)
+        args = {"imageviewer": [png], "musicplayer": [wav]}
+        denied, audited = [], 0
+        for name, path in built_apps():
+            trace = os.path.join(s.logs, name + ".ktrace")
+            p = s.start(name, ["ktrace", "-f", trace, "-i", "-t", "cnp", path, *args.get(name, [])])
+            try:
+                wait_for(lambda: "Capsicum sandbox active" in s.read_log(name), 15, f"{name} to enter its sandbox")
+            except Failed:
+                if name != "gpudemo":     # draws through its own path, unsandboxed
+                    denied.append(f"{name}: never entered its sandbox")
+            time.sleep(2.0 * TIME_SCALE)
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+                p.wait(5)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+            dump = subprocess.run(["kdump", "-f", trace, "-t", "cnp"], capture_output=True, text=True, errors="replace").stdout
+            os.unlink(trace)
+            inside, last = False, ""
+            for line in dump.splitlines():
+                if "CALL" in line and "cap_enter" in line:
+                    inside = True
+                m = re.search(r'NAMI\s+"(.*)"', line)
+                if m:
+                    last = m.group(1)
+                elif inside and " CAP " in line and not any(h in last for h in harmless):
+                    denied.append(f"{name}: {last or line.strip()}")
+            audited += 1
+        check(audited >= 20, f"only {audited} apps audited")
+        check(not denied, f"refused by the sandbox: {sorted(set(denied))[:12]}")
+
+
+class FakeMailServer:
+    """Just enough IMAP and SMTP for Mail: one thread per connection, and a record
+    of what it was told. With `tls`, wrapped in that certificate."""
+    IMAP_PORT, IMAPS_PORT, SMTP_PORT = 11143, 11993, 11025
+
+    def __init__(self, cert=None):
+        self.logins, self.sent, self.fetches, self.socks, self.cert = [], [], [], [], cert
+        self.listen(self.IMAP_PORT, self.imap)
+        self.listen(self.SMTP_PORT, self.smtp)
+        if cert:
+            self.listen(self.IMAPS_PORT, self.imap, tls=True)
+
+    def listen(self, port, handler, tls=False):
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", port))
+        srv.listen(8)
+        self.socks.append(srv)
+        threading.Thread(target=self.accept, args=(srv, handler, tls), daemon=True).start()
+
+    def accept(self, srv, handler, tls):
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.serve, args=(conn, handler, tls), daemon=True).start()
+
+    def serve(self, conn, handler, tls):
+        try:
+            if tls:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(self.cert)
+                conn = ctx.wrap_socket(conn, server_side=True)
+            handler(conn, conn.makefile("rb"))
+        except (OSError, ssl.SSLError):
+            pass
+        finally:
+            conn.close()
+
+    def imap(self, conn, lines):
+        conn.sendall(b"* OK ready\r\n")
+        for raw in lines:
+            tag, _, rest = raw.decode("latin-1").strip().partition(" ")
+            cmd = rest.split(" ")[0].upper()
+            if cmd == "CAPABILITY":
+                conn.sendall(f"* CAPABILITY IMAP4rev1\r\n{tag} OK done\r\n".encode())
+            elif cmd == "LOGIN":
+                self.logins.append(rest)
+                conn.sendall(f"{tag} OK logged in\r\n".encode())
+            elif cmd in ("SELECT", "EXAMINE"):
+                conn.sendall(f"* 1 EXISTS\r\n* FLAGS (\\Seen)\r\n{tag} OK [READ-WRITE] done\r\n".encode())
+            elif cmd == "UID":
+                if "SEARCH" in rest:
+                    conn.sendall(f"* SEARCH 7\r\n{tag} OK done\r\n".encode())
+                elif "BODY[" in rest:
+                    text = "The body of the message.\r\n"
+                    conn.sendall(f"* 1 FETCH (UID 7 BODY[TEXT] {{{len(text)}}}\r\n{text})\r\n{tag} OK done\r\n".encode())
+                else:
+                    self.fetches.append(rest)
+                    conn.sendall(f'* 1 FETCH (UID 7 FLAGS () BODYSTRUCTURE ("text" "plain" NIL NIL NIL "7bit" 5 1) ENVELOPE ("Thu, 5 Nov 2026 01:00:00 +0900" "=?utf-8?B?7JWI64WV?= Hello from IMAP" (("Ann" NIL "ann" "example.com")) NIL NIL (("Me" NIL "me" "example.com")) NIL NIL NIL "<1@x>"))\r\n{tag} OK done\r\n'.encode())
+            elif cmd == "LOGOUT":
+                conn.sendall(f"* BYE\r\n{tag} OK bye\r\n".encode())
+                return
+            else:
+                conn.sendall(f"{tag} BAD no\r\n".encode())
+
+    def smtp(self, conn, lines):
+        conn.sendall(b"220 ready\r\n")
+        for raw in lines:
+            cmd = raw.decode("latin-1").strip().upper()
+            if cmd.startswith(("EHLO", "HELO")):
+                conn.sendall(b"250 ok\r\n")
+            elif cmd == "DATA":
+                conn.sendall(b"354 go\r\n")
+                body = b""
+                for part in lines:
+                    if part in (b".\r\n", b".\n"):
+                        break
+                    body += part
+                self.sent.append(body.decode("latin-1"))
+                conn.sendall(b"250 queued\r\n")
+            elif cmd.startswith("QUIT"):
+                conn.sendall(b"221 bye\r\n")
+                return
+            else:
+                conn.sendall(b"250 ok\r\n")
+
+    def close(self):
+        for srv in self.socks:
+            try:
+                srv.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            srv.close()
+
+
+def s_mail(work):
+    """Mail works inside its sandbox: fetches and sends through the compositor's
+    connections, verifies certificates, keeps accounts and messages, and says when
+    it can't reach a server."""
+    problems = []
+    os.environ["FBX_TEST_CONNECT_PORTS"] = f"{FakeMailServer.IMAP_PORT},{FakeMailServer.IMAPS_PORT},{FakeMailServer.SMTP_PORT}"
+    cert = os.path.join(work, "mail-cert.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost",
+                    "-addext", "subjectAltName=DNS:localhost", "-keyout", cert, "-out", cert],
+                   check=True, capture_output=True)
+
+    def seed(s, imap_port, ssl_on=False):
+        store = os.path.join(s.home, ".freebsdx-mail")
+        os.makedirs(store, exist_ok=True)
+        with open(os.path.join(store, "accounts"), "w") as f:
+            f.write("\t".join(["me", "Me", "me@example.com", "localhost", str(imap_port), "1" if ssl_on else "0",
+                               "localhost", str(FakeMailServer.SMTP_PORT), "0", "me", "secret"]) + "\n")
+        return store
+
+    def status(d):
+        return " | ".join(d.texts())
+
+    def wait_text(d, want, what):
+        try:
+            wait_for(lambda: want in status(d), 10, what)
+        except Failed:
+            problems.append(f"{what}: {status(d)[:300]}")
+
+    try:
+        with Session(work, "mail") as s:
+            s.shell()
+            server = FakeMailServer(cert)
+            store = seed(s, FakeMailServer.IMAP_PORT)
+
+            # Fetching: it starts with a sync.
+            d = AppDriver(s, "mail")
+            wait_text(d, "안녕 Hello from IMAP", "a message from the server to be listed, its subject decoded")
+            wait_text(d, "1 messages", "the count")
+            if not any("me" in login and "secret" in login for login in server.logins):
+                problems.append(f"the server saw no login: {server.logins}")
+            cached = os.path.join(store, "me", "INBOX", "7.eml")
+            if not os.path.exists(cached):
+                problems.append("the message wasn't kept on disk")
+            d.close()
+
+            # With the server gone: what it kept is there, and it says why it's stale.
+            server.close()
+            d = AppDriver(s, "mail")
+            wait_text(d, "Sync failed", "a failed sync to say so")
+            if "Hello from IMAP" not in status(d):
+                problems.append(f"a failed sync hid the kept messages: {status(d)[:300]}")
+            d.close()
+
+            # Sending, with an attachment picked in the sandbox.
+            server = FakeMailServer(cert)
+            with open(os.path.join(s.home, "att.bin"), "wb") as f:
+                f.write(b"attached bytes!")     # 15 bytes: base64 has no padding...
+            with open(os.path.join(s.home, "att2.bin"), "wb") as f:
+                f.write(b"attached bytes")      # ...and 14 has "="
+            d = AppDriver(s, "mail", "--open", "mailto:bob@example.com")
+            wait_text(d, "Hello from IMAP", "the sync behind the compose form")
+            for _ in range(8):           # the buttons, To, CC, to Subject
+                d.tab()
+            d.type("Greetings")
+            d.tab()                      # Attach…
+            for index in (0, 1):
+                d.enter()
+                time.sleep(1.2 * TIME_SCALE)
+                for _ in range(index + 1):
+                    d.tab()
+                d.enter()
+                d.enter()
+                time.sleep(1.2 * TIME_SCALE)
+            if "2 file(s)" not in d.texts():
+                problems.append(f"attachments weren't taken: {status(d)[:300]}")
+            d.tab()                      # the message
+            d.type("Hi Bob")
+            for _ in range(5):
+                d.tab(shift=True)        # back to Send
+            d.enter()
+            wait_text(d, "Sent!", "sending to report success")
+            mail = "".join(server.sent)
+            for want in ("To: bob@example.com", "Subject: Greetings", "Hi Bob",
+                         'filename="att.bin"', "YXR0YWNoZWQgYnl0ZXMh", 'filename="att2.bin"', "YXR0YWNoZWQgYnl0ZXM="):
+                if want not in mail:
+                    problems.append(f"the server didn't get {want!r}: {mail[:400]!r}")
+            if not [n for n in os.listdir(os.path.join(store, "me", "Sent")) if n.endswith(".eml")]:
+                problems.append("the sent message wasn't kept")
+            d.close()
+            server.close()
+
+            # Certificates: a server this machine trusts, then one it doesn't.
+            server = FakeMailServer(cert)
+            shutil.rmtree(os.path.join(store, "me"))
+            seed(s, FakeMailServer.IMAPS_PORT, ssl_on=True)
+            os.environ["CURL_CA_BUNDLE"] = cert
+            d = AppDriver(s, "mail")
+            wait_text(d, "Hello from IMAP", "fetching over TLS from a trusted server")
+            d.close()
+            del os.environ["CURL_CA_BUNDLE"]
+            d = AppDriver(s, "mail")
+            wait_text(d, "Sync failed", "refusing a server with an untrusted certificate")
+            d.close()
+            server.close()
+
+            # A port that isn't for mail: refused by the compositor, and it says so.
+            seed(s, 8080)
+            d = AppDriver(s, "mail")
+            wait_text(d, "that port isn't allowed", "a port outside the mail ports to be refused")
+            d.close()
+            denied = [l for l in s.read_log("compositor").splitlines() if "DENIED: com.freebsdx.mail connecting" in l]
+            if not denied:
+                problems.append("the compositor logged no refusal")
+
+            # Only Mail may ask at all.
+            r = call("com.freebsdx.Fetch", 2, struct.pack("<HH252s", FakeMailServer.IMAP_PORT, 0, b"localhost"))
+            if r is None or struct.unpack("<i", r[-256:-252])[0] != 1:
+                problems.append("a client that isn't Mail wasn't refused a connection")
+
+            # Set up by hand: written down, for next time, privately.
+            shutil.rmtree(store)
+            d = AppDriver(s, "mail")
+            for _ in range(3):           # Compose, Sync, + Add Account
+                d.tab()
+            d.enter()
+            time.sleep(0.8 * TIME_SCALE)
+            for value in ("Me", "typed@example.com", "imap.example.com", "993", "smtp.example.com", "587", "typed", "pw"):
+                d.tab()
+                d.type(value)
+            d.tab()                      # Cancel
+            d.tab()                      # Add Account
+            d.enter()
+            time.sleep(1.0 * TIME_SCALE)
+            accounts = os.path.join(store, "accounts")
+            if not os.path.exists(accounts) or "typed@example.com" not in open(accounts).read():
+                problems.append(f"the account wasn't saved: {status(d)[:300]}")
+            elif os.stat(accounts).st_mode & 0o077:
+                problems.append("the account file (it holds the password) is readable by others")
+            d.close()
+            d = AppDriver(s, "mail")
+            if "typed@example.com" not in status(d):
+                problems.append(f"the account was gone next time: {status(d)[:300]}")
+            d.close()
+    finally:
+        os.environ.pop("FBX_TEST_CONNECT_PORTS", None)
+
+    check(not problems, "; ".join(problems))
+
+
 def s_persistence(work):
     """What you save is still there: Text Editor saves and opens through the
     powerbox (the user picks in the shell, the app gets one descriptor; apps can
@@ -1206,6 +1636,9 @@ def s_smoke_tools(work):
 
 SCENARIOS = {
     "file-open": s_file_open,
+    "media": s_media,
+    "mail": s_mail,
+    "sandbox-audit": s_sandbox_audit,
     "replies": s_replies,
     "window-chrome": s_window_chrome,
     "persistence": s_persistence,
