@@ -730,9 +730,10 @@ class AppDriver:
         time.sleep(1.0 * TIME_SCALE)
         self.c = connect()
 
-    def key(self, code, ch="", shift=False):
+    def key(self, code, ch="", shift=False, ctrl=False):
+        mods = (1 if shift else 0) | (2 if ctrl else 0)
         for state in (1, 0):
-            payload = struct.pack(INPUT_FMT, 2, code, state, 1 if shift else 0, ord(ch) if ch else 0)
+            payload = struct.pack(INPUT_FMT, 2, code, state, mods, ord(ch) if ch else 0)
             self.c.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, payload))
             time.sleep(0.06 * TIME_SCALE)
 
@@ -741,7 +742,7 @@ class AppDriver:
             self.key(self.KEYCODE.get(ch.lower(), 30 if ch.isalpha() else 57), ch, shift=ch in "+*")
         time.sleep(0.3 * TIME_SCALE)
 
-    def tab(self):   self.key(15)
+    def tab(self, shift=False): self.key(15, shift=shift)
     def enter(self): self.key(28); time.sleep(0.3 * TIME_SCALE)
 
     def screen(self):
@@ -773,8 +774,14 @@ def s_app_tasks(work):
     """Apps do their job, driven from the keyboard and checked on screen:
     Calculator computes (typing previews, Enter commits once and chains), Text
     Editor types into the document, Notes' "+ New Note" and Contacts' "+ Add
-    Contact" let you type straight away."""
+    Contact" let you type straight away, Files opens folders, Terminal runs
+    commands, gets Tab (Shift+Tab leaves it) and renames sessions, Weather's
+    field holds what's typed, Calendar's grid gets the window."""
     problems = []
+    # A plain shell: the user's zsh would stop at its first-run wizard in the
+    # scenario's empty $HOME.
+    saved_shell = os.environ.get("SHELL")
+    os.environ["SHELL"] = "/bin/sh"
     with Session(work, "app-tasks") as s:
         calc = AppDriver(s, "calculator")
         calc.type("12+30")
@@ -818,6 +825,78 @@ def s_app_tasks(work):
         if "Ada" not in t or "Search contacts…" not in t:
             problems.append(f"contacts: the new-contact form didn't take the typing ({t[:10]})")
         contacts.close()
+
+        for name in ("alpha.txt", "docs/inner.txt"):
+            path = os.path.join(s.home, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").write("x\n")
+        files = AppDriver(s, "files")
+        rows = files.screen()
+        names = [(x, t.strip()) for x, _, t in rows if t.strip() in ("alpha.txt", "/ docs")]
+        if len(names) != 2 or any(x > 100 for x, _ in names):
+            problems.append(f"files: names not listed at the left ({rows[:6]})")
+        files.tab(); files.tab(); files.tab(); files.enter()   # Up, Snapshots, then the docs row
+        time.sleep(0.7 * TIME_SCALE)
+        t = [x.strip() for x in files.texts()]
+        if "inner.txt" not in t or "1 item" not in t:
+            problems.append(f"files: Enter on a folder didn't open it ({t[:8]})")
+        files.close()
+
+        term = AppDriver(s, "terminal")                    # SHELL=/bin/sh: see below
+        term.type("cat -t")
+        term.enter()
+        time.sleep(0.5 * TIME_SCALE)
+        term.tab()                                         # Tab goes to the program, not to focus…
+        term.type("x")
+        term.enter()
+        time.sleep(0.7 * TIME_SCALE)
+        t = term.texts()
+        if not any(l.strip() == "^Ix" for l in t):
+            problems.append(f"terminal: Tab or typing didn't reach the shell ({t[-6:]})")
+        term.key(32, "d", ctrl=True)                       # end cat: sessions outlive the app
+        time.sleep(0.4 * TIME_SCALE)
+        term.tab(shift=True)                               # …and Shift+Tab leaves the pane
+        term.type("zz")
+        term.enter()
+        time.sleep(0.7 * TIME_SCALE)
+        t = term.texts()
+        if any("zz" in l for l in t):
+            problems.append("terminal: Shift+Tab didn't move focus out of the pane")
+        term.close()
+
+        term = AppDriver(s, "terminal")                    # Ctrl+Shift+R renames the session
+        time.sleep(0.5 * TIME_SCALE)
+        term.key(19, "R", shift=True, ctrl=True)
+        time.sleep(0.4 * TIME_SCALE)
+        term.type("x")
+        term.enter()
+        time.sleep(0.4 * TIME_SCALE)
+        term.type("echo back")
+        term.enter()
+        time.sleep(0.7 * TIME_SCALE)
+        t = [l.strip() for l in term.texts()]
+        if "session-1x" not in t:
+            problems.append(f"terminal: rename didn't reach the tab ({t[:6]})")
+        if "back" not in t:
+            problems.append(f"terminal: typing didn't return to the shell after renaming ({t[-4:]})")
+        term.close()
+
+        weather = AppDriver(s, "weather")
+        weather.type("Seoul")
+        t = weather.texts()
+        if "Seoul" not in t:
+            problems.append(f"weather: the city field reads {t[:1]} (its hint must not be its text)")
+        weather.close()
+
+        cal = AppDriver(s, "calendar")
+        grid_y = [y for _, y, t in cal.screen() if t == "Sun"]
+        if not grid_y or grid_y[0] > 150:
+            problems.append(f"calendar: the month grid starts at y={grid_y} (toolbars took the window)")
+        cal.close()
+    if saved_shell is None:
+        del os.environ["SHELL"]
+    else:
+        os.environ["SHELL"] = saved_shell
     check(not problems, " | ".join(problems))
 
 
