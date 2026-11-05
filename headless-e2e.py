@@ -1003,8 +1003,7 @@ def s_replies(work):
         return reply[44:] if reply else b""
 
     with Session(work, "replies"):
-        B, N, W, D, A = ("com.freebsdx.Bookmarks", "com.freebsdx.Notes", "com.freebsdx.Weather",
-                         "com.freebsdx.Disk", "com.freebsdx.Archive")
+        B, N, W, D = ("com.freebsdx.Bookmarks", "com.freebsdx.Notes", "com.freebsdx.Weather", "com.freebsdx.Disk")
         for title, url in ((b"One", b"http://one/"), (b"Two", b"http://two/")):
             one(B, 1, title.ljust(60, b"\0") + url, "bookmarks add")
         p0 = one(B, 3, struct.pack("<I", 0), "bookmarks list")
@@ -1031,7 +1030,6 @@ def s_replies(work):
         one(D, 2, b"nosuch!device".ljust(32, b"\0"), "partitions of a bad name")
 
         one(N, 5, struct.pack("<I", 0), "notes list")
-        one(A, 1, struct.pack("<II", 0, 0) + b"/nonexistent.zip", "archive list of a missing file")
     check(not problems, " | ".join(problems))
 
 
@@ -1446,6 +1444,152 @@ def s_mail(work):
     check(not problems, "; ".join(problems))
 
 
+def s_app_paths(work):
+    """A client that isn't the built-in app concerned can't make the compositor
+    read, write or reveal paths for it, and doesn't hear which files others open."""
+    import tarfile
+    Q = lambda p, n: p.encode().ljust(n, b"\0")
+    problems = []
+    with Session(work, "app-paths") as s:
+        s.shell()
+        home = s.home
+        ssh = os.path.join(home, ".ssh")
+        os.makedirs(ssh, exist_ok=True)
+        key = os.path.join(ssh, "id_rsa")
+        with open(key, "w") as f:
+            f.write("CANARY-PRIVATE-KEY\n")
+        victim = os.path.join(home, "thesis.txt")
+        with open(victim, "w") as f:
+            f.write("my work\n")
+        ics = os.path.join(home, "planted.ics")
+        with open(ics, "w") as f:
+            f.write("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Planted\r\n"
+                    "DTSTART:20270101T090000\r\nDTEND:20270101T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+        vcf = os.path.join(home, "planted.vcf")
+        with open(vcf, "w") as f:
+            f.write("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Planted Person\r\nN:Person;Planted;;;\r\nEND:VCARD\r\n")
+        tar = os.path.join(home, "planted.tar")
+        with tarfile.open(tar, "w") as t:
+            t.add(key, arcname="dropped.txt")
+        png = os.path.join(home, "planted.png")
+        write_png(png, 8, 8, (1, 2, 3))
+
+        def refused(label, service, op, payload, did=None):
+            """No answer, and whatever the call would have done didn't happen."""
+            r = call(service, op, payload)
+            time.sleep(0.3)
+            happened = did() if did else False
+            if r is not None or happened:
+                problems.append(f"{label}: {'answered' if r is not None else ''}{' and did it' if happened else ''}")
+
+        # Reading files by name
+        refused("Portal.OpenFile in home", "com.freebsdx.Portal", 0x01, Q(key, 252))
+        refused("Portal.OpenFile via /tmp/..", "com.freebsdx.Portal", 0x01, Q("/tmp/.." + key, 252))
+        refused("Portal.ListDir", "com.freebsdx.Portal", 0x05, Q(ssh, 252))
+        refused("Portal.ZfsSnapshot", "com.freebsdx.Portal", 0x07, Q(home, 252))
+        refused("Portal.ZfsRollback", "com.freebsdx.Portal", 0x06, Q(home + "/.zfs/snapshot/x", 252))
+        # Archives
+        out = os.path.join(home, "stolen.tar")
+        refused("Archive.Create", "com.freebsdx.Archive", 0x03, Q(out, 128) + Q(ssh, 128),
+                lambda: os.path.exists(out))
+        dest = os.path.join(home, "dest")
+        os.makedirs(dest, exist_ok=True)
+        refused("Archive.Extract", "com.freebsdx.Archive", 0x02, Q(tar, 128) + Q(dest, 128),
+                lambda: os.listdir(dest))
+        refused("Archive.List", "com.freebsdx.Archive", 0x01, b"\0" * 8 + Q(tar, 248))
+        # The screen, and overwriting a file with it
+        before = open(victim, "rb").read()
+        refused("Screenshot.Capture over a file", "com.freebsdx.Screenshot", 0x01,
+                b"\0" * 4 + Q(victim, 220) + b"\0" * 32, lambda: open(victim, "rb").read() != before)
+        refused("Screenshot.CaptureRegion", "com.freebsdx.Screenshot", 0x02,
+                struct.pack("<IiiII", 0, 0, 0, 16, 16) + Q(os.path.join(home, "r.png"), 200) + b"\0" * 28,
+                lambda: os.path.exists(os.path.join(home, "r.png")))
+        # Imports the compositor reads for the caller
+        refused("Calendar.ImportIcs", "com.freebsdx.Calendar", 0x06, Q(ics, 252))
+        refused("Contacts.ImportVCard", "com.freebsdx.Contacts", 0x07, Q(vcf, 256))
+        # Wallpaper: the compositor decodes whatever file it's given
+        got = lambda: Q(png, 252) in (call("com.freebsdx.Wallpaper", 0x02) or b"")
+        refused("Wallpaper.Set", "com.freebsdx.Wallpaper", 0x01, Q(png, 252) + b"\0" * 4, got)
+        refused("Wallpaper.SetWorkspace", "com.freebsdx.Wallpaper", 0x03,
+                struct.pack("<I", 0) + struct.pack("<I", 0) + Q(png, 248), got)
+        # Sizes of any directory
+        refused("DiskUsage.Scan", "com.freebsdx.DiskUsage", 0x01, Q(ssh, 64) + b"\0" * 192)
+        # Printing a file by name (no app uses this)
+        refused("Print.PrintFile", "com.freebsdx.Print", 0x02, Q("", 64) + Q(key, 128) + Q("x", 48) + struct.pack("<IIII", 1, 0, 0, 0))
+
+        # Which file someone opens is private: only the shell and that app hear it.
+        spy = connect()
+        spy.settimeout(0.3)
+        launch_with_file("com.freebsdx.imageviewer", png)
+        heard = b""
+        end = time.time() + 1.5
+        while time.time() < end:
+            try:
+                heard += spy.recv(4096)
+            except socket.timeout:
+                pass
+        spy.close()
+        if png.encode() in heard:
+            problems.append("LaunchWithFile: another app heard the opened file's path")
+        # ...and the shell still acted on it.
+        wait_for(lambda: "planted.png" in s.read_log("compositor"), 15, "the shell to open the file")
+
+        # Reads apps rely on stay open.
+        if call("com.freebsdx.Wallpaper", 0x02) is None:
+            problems.append("reading the wallpaper was refused")
+
+        # The apps these belong to still work.
+        files = AppDriver(s, "files")
+        wait_for(lambda: any("thesis.txt" in x for x in files.texts()), 10, "Files to list the home folder")
+        files.close()
+        arch = AppDriver(s, "archive", "--open", tar)
+        wait_for(lambda: any("dropped.txt" in x for x in arch.texts()), 10, "Archive to list its file")
+        arch.close()
+        # (only that app may ask, so this is where a failed list's reply is checked)
+        arch = AppDriver(s, "archive", "--open", "/nonexistent.zip")
+        wait_for(lambda: any("Cannot open archive" in x for x in arch.texts()), 10, "Archive to report a missing file")
+        arch.close()
+        people = AppDriver(s, "contacts", "--open", vcf)
+        wait_for(lambda: any("Planted" in x for x in people.texts()), 10, "Contacts to import its file")
+        people.close()
+
+        # Calendar imports the file the user picks, by descriptor. Tab reaches the
+        # toolbar's six buttons, then Import; the picker lists folders, then files.
+        names = [n for n in os.listdir(home) if not n.startswith(".")]
+        listed = sorted(n for n in names if os.path.isdir(os.path.join(home, n))) + \
+                 sorted(n for n in names if not os.path.isdir(os.path.join(home, n)))
+        cal = AppDriver(s, "calendar")
+        for _ in range(7):
+            cal.tab()
+        cal.enter()
+        time.sleep(1.2 * TIME_SCALE)
+        for _ in range(listed.index("planted.ics") + 1):
+            cal.tab()
+        cal.enter()
+        cal.enter()
+        wait_for(lambda: any("Imported 1 event" in x for x in cal.texts()), 10, "Calendar to import the picked file")
+        cal.close()
+
+        # A running Browser still hears a file meant for it, without a second window.
+        page = os.path.join(home, "page.html")
+        with open(page, "w") as f:
+            f.write("<html><head><title>first</title></head><body>hi</body></html>")
+        launch_with_file("com.freebsdx.browser", page)
+        browser = os.path.join(OUT, "browser")
+        wait_for(lambda: procs_running(browser) == 1, 15, "the Browser to start")
+        time.sleep(1.5 * TIME_SCALE)
+        launch_with_file("com.freebsdx.browser", page)
+        time.sleep(1.5 * TIME_SCALE)
+        check(procs_running(browser) == 1, "a second file for a running Browser started another")
+        second = os.path.join(home, "second.html")
+        shutil.copy(page, second)
+        tab = AppDriver(s, "browser")
+        launch_with_file("com.freebsdx.browser", second)
+        wait_for(lambda: any("second.html" in x for x in tab.texts()), 10, "a running Browser to hear its file")
+        tab.close()
+    check(not problems, "app-paths:\n  " + "\n  ".join(problems))
+
+
 def s_persistence(work):
     """What you save is still there: Text Editor saves and opens through the
     powerbox (the user picks in the shell, the app gets one descriptor; apps can
@@ -1639,6 +1783,7 @@ SCENARIOS = {
     "media": s_media,
     "mail": s_mail,
     "sandbox-audit": s_sandbox_audit,
+    "app-paths": s_app_paths,
     "replies": s_replies,
     "window-chrome": s_window_chrome,
     "persistence": s_persistence,
