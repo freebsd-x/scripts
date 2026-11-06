@@ -34,6 +34,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -111,10 +112,18 @@ def call(service, opcode, payload=b"", timeout=1.5):
     s = connect()
     tid = 4242
     s.send(xbus_msg(service, opcode, payload, tid))
-    s.settimeout(timeout)
+    end = time.time() + timeout
     try:
         while True:
+            # A deadline, not just a socket timeout: broadcasts arriving would
+            # restart that one for as long as they keep coming.
+            left = end - time.time()
+            if left <= 0:
+                return None
+            s.settimeout(left)
             d = s.recv(4096)
+            if not d:          # the compositor is gone; never spin on a closed socket
+                return None
             if len(d) >= 300 and struct.unpack("<I", d[4:8])[0] == tid:
                 return d
     except socket.timeout:
@@ -136,10 +145,16 @@ def render_msg(surface_id, status, w=400, h=300):
 
 def recv_render_reply(s, timeout=2.0):
     """The next 56-byte RenderMessage on s (skipping broadcasts), or None."""
-    s.settimeout(timeout)
+    end = time.time() + timeout
     try:
         while True:
+            left = end - time.time()
+            if left <= 0:
+                return None
+            s.settimeout(left)
             d = s.recv(4096)
+            if not d:
+                return None
             if len(d) == RENDER_MSG_SIZE:
                 return struct.unpack("<IIII", d[:16])
     except socket.timeout:
@@ -248,9 +263,12 @@ class Session:
     """A headless compositor with a throwaway $HOME, plus whatever a scenario
     starts in it. Everything is torn down on exit."""
 
-    def __init__(self, workdir, name, strict=False, config=None):
+    def __init__(self, workdir, name, strict=False, config=None, browser_engine="/nonexistent"):
+        self.browser_engine = browser_engine
         self.home = os.path.join(workdir, name, "home")
         self.logs = os.path.join(workdir, name)
+        self.runtime = os.path.join(workdir, name, "runtime")   # where Wayland's socket goes
+        os.makedirs(self.runtime, mode=0o700, exist_ok=True)
         os.makedirs(os.path.join(self.home, ".config", "freebsd-x"), exist_ok=True)
         if config:
             with open(os.path.join(self.home, ".config", "freebsd-x", "config"), "w") as f:
@@ -260,7 +278,11 @@ class Session:
 
     def env(self, **extra):
         # FBX_NO_AUDIO: nothing here should play through the real sound card.
-        e = dict(os.environ, HOME=self.home, FBX_NO_AUDIO="1")
+        e = dict(os.environ, HOME=self.home, FBX_NO_AUDIO="1", XDG_RUNTIME_DIR=self.runtime,
+                 # Starting Chromium costs seconds in every scenario that opens each
+                 # app; they get the Browser's own window instead.
+                 FBX_BROWSER_ENGINE=self.browser_engine,
+                 FBX_BROWSER_ARGS="--disable-background-networking")
         e.update(extra)
         return e
 
@@ -762,9 +784,9 @@ class AppDriver:
     KEYCODE = {**{str(d): (11 if d == 0 else d + 1) for d in range(10)},
                "+": 13, "=": 13, "-": 12, "*": 9, "/": 53, ".": 52, " ": 57}
 
-    def __init__(self, session, name, *args):
+    def __init__(self, session, name, *args, env=None):
         self.s, self.name = session, name
-        self.p = session.start(name, [os.path.join(OUT, name), *args], FBX_UI_DUMP="1")
+        self.p = session.start(name, [os.path.join(OUT, name), *args], FBX_UI_DUMP="1", **(env or {}))
         wait_for(lambda: "Painting frame" in session.read_log(name), 15, f"{name} to paint")
         time.sleep(1.0 * TIME_SCALE)
         self.c = connect()
@@ -984,6 +1006,8 @@ def s_replies(work):
         try:
             while reply is None:
                 d = s.recv(4096)
+                if not d:
+                    break
                 if len(d) >= 300 and d[8:40].split(b"\0")[0] == service.encode():
                     got = struct.unpack("<I", d[4:8])[0]
                     if got == tid:
@@ -993,6 +1017,8 @@ def s_replies(work):
             s.settimeout(0.4 * TIME_SCALE)
             while True:
                 d = s.recv(4096)
+                if not d:
+                    break
                 if len(d) >= 300 and struct.unpack("<I", d[4:8])[0] == tid:
                     problems.append(f"{name}: a second reply to one request")
         except socket.timeout:
@@ -1570,24 +1596,184 @@ def s_app_paths(work):
         wait_for(lambda: any("Imported 1 event" in x for x in cal.texts()), 10, "Calendar to import the picked file")
         cal.close()
 
-        # A running Browser still hears a file meant for it, without a second window.
-        page = os.path.join(home, "page.html")
-        with open(page, "w") as f:
-            f.write("<html><head><title>first</title></head><body>hi</body></html>")
-        launch_with_file("com.freebsdx.browser", page)
-        browser = os.path.join(OUT, "browser")
-        wait_for(lambda: procs_running(browser) == 1, 15, "the Browser to start")
-        time.sleep(1.5 * TIME_SCALE)
-        launch_with_file("com.freebsdx.browser", page)
-        time.sleep(1.5 * TIME_SCALE)
-        check(procs_running(browser) == 1, "a second file for a running Browser started another")
-        second = os.path.join(home, "second.html")
-        shutil.copy(page, second)
-        tab = AppDriver(s, "browser")
-        launch_with_file("com.freebsdx.browser", second)
-        wait_for(lambda: any("second.html" in x for x in tab.texts()), 10, "a running Browser to hear its file")
-        tab.close()
+        # The app a file is meant for still hears it: Mail, composing from a link.
+        mail = AppDriver(s, "mail")
+        launch_with_file("com.freebsdx.mail", "mailto:someone@example.org")
+        wait_for(lambda: any("someone@example.org" in x for x in mail.texts()), 10, "a running Mail to hear its link")
+        mail.close()
     check(not problems, "app-paths:\n  " + "\n  ".join(problems))
+
+
+def window_top(ppm, x, below_y):
+    """The row of a window's title bar: the dark band at the very top of its column."""
+    parts = open(ppm, "rb").read().split(b"\n", 3)
+    w = int(parts[1].split()[0])
+    y = below_y
+    while y > 0:
+        r, g, b = parts[3][(y * w + x + 40) * 3:(y * w + x + 40) * 3 + 3]
+        if r < 60 and g < 60 and b < 70 and abs(int(b) - int(r)) < 12:   # the title bar's grey
+            return y
+        y -= 1
+    return below_y
+
+
+def s_browser(work):
+    """The Browser is real: Chromium, through the Wayland bridge, on this
+    compositor. It shows a page, the page gets the mouse and keyboard and keeps
+    drawing, it fits the screen, and it asks only for what it was told to open."""
+    engine = "/usr/local/bin/chrome"
+    if not os.access(engine, os.X_OK):
+        print("  (chromium isn't installed: only the missing-engine message is checked)")
+    RED, GREEN, BLUE = (220, 40, 40), (40, 200, 40), (40, 40, 220)
+    with Session(work, "browser", browser_engine=engine) as s:
+        s.shell()
+        # No engine: it says so, in a window.
+        none = AppDriver(s, "browser", env={"FBX_BROWSER_ENGINE": "/nonexistent"})
+        wait_for(lambda: any("isn't installed" in x for x in none.texts()), 10, "the missing-engine message")
+        none.close()
+        if not os.access(engine, os.X_OK):
+            return
+
+        page = os.path.join(s.home, "page.html")
+        with open(page, "w") as f:
+            f.write("""<!doctype html><title>Colour test</title>
+<body style="margin:0;height:100vh;background:rgb(220,40,40)"><script>
+addEventListener("mousedown", () => document.body.style.background = "rgb(40,200,40)");
+addEventListener("keydown",   () => document.body.style.background = "rgb(40,40,220)");
+</script>""")
+        launch_with_file("com.freebsdx.browser", page)
+        wait_for(lambda: on_screen(s, RED, "page") > 5000, 60, "the page's pixels on screen")
+        # The clicks below aim by this capture, so it has to show the window at rest,
+        # not still animating open.
+        size = [0]
+        def settled():
+            now = on_screen(s, RED, "page")
+            same = now == size[0]
+            size[0] = now
+            return same
+        wait_for(settled, 10, "the window to finish opening")
+
+        # Frame timing goes to the bridge alone: anyone else would be woken every
+        # frame, and could watch when other apps draw. (28 bytes is PresentFeedback.)
+        spy = connect()
+        spy.settimeout(0.2)
+        heard, end = 0, time.time() + 1.5
+        while time.time() < end:
+            try:
+                heard += len(spy.recv(4096)) == 28
+            except socket.timeout:
+                pass
+        spy.close()
+        check(not heard, f"an ordinary client was sent {heard} frame timings")
+
+        # It fits: nothing of the window is lost below the screen's bottom edge.
+        ppm = os.path.join(s.logs, "page.ppm")
+        parts = open(ppm, "rb").read().split(b"\n", 3)
+        w, h = map(int, parts[1].split())
+        red_rows = [y for y in range(h) if any(
+            abs(parts[3][(y * w + x) * 3] - 220) < 12 and abs(parts[3][(y * w + x) * 3 + 1] - 40) < 12
+            for x in range(0, w, 16))]
+        check(red_rows, "no page rows found")
+        check(max(red_rows) < h - 40, f"the window runs under the taskbar (page reaches row {max(red_rows)} of {h})")
+        cols = [x for x in range(w) if abs(parts[3][(red_rows[0] * w + x) * 3] - 220) < 12]
+        mid_x, mid_y = (cols[0] + cols[-1]) // 2, (red_rows[0] + red_rows[-1]) // 2
+
+        # The mouse and the keyboard reach the page, and it redraws for them.
+        mouse = Pointer()
+        mouse.click(mid_x, mid_y)
+        mouse.close()
+        wait_for(lambda: on_screen(s, GREEN, "clicked") > 5000, 15, "a click to reach the page")
+        c = connect()
+        for state in (1, 0):
+            c.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, struct.pack(INPUT_FMT, 2, 30, state, 0, ord("a"))))
+            time.sleep(0.1)
+        c.close()
+        wait_for(lambda: on_screen(s, BLUE, "typed") > 5000, 15, "a key to reach the page")
+
+        # Its menu opens at its button, not across the window, and closing it (a popup
+        # going away, which used to kill the bridge and every window with it) is safe.
+        def blue_at(tag, x, y):
+            on_screen(s, BLUE, tag)
+            p = open(os.path.join(s.logs, tag + ".ppm"), "rb").read().split(b"\n", 3)
+            r, g, b = p[3][(y * w + x) * 3:(y * w + x) * 3 + 3]
+            return abs(r - 40) < 12 and abs(g - 40) < 12 and abs(b - 220) < 12
+        left, right = (cols[0] + 60, red_rows[0] + 200), (cols[-1] - 60, red_rows[0] + 200)
+        check(blue_at("before-menu", *right), "the page isn't where it was before the menu")
+        mouse = Pointer()
+        mouse.click(cols[-1] - 24, red_rows[0] - 26)      # the ⋮ button, at the toolbar's right end
+        mouse.close()
+        wait_for(lambda: not blue_at("menu", *right), 10, "the menu to open at its button")
+        check(blue_at("menu", *left), "the menu opened at the window's left edge, away from its button")
+        keys = connect()
+        def press(code, ch=0, mods=0):
+            for state in (1, 0):
+                keys.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, struct.pack(INPUT_FMT, 2, code, state, mods, ch)))
+                time.sleep(0.06)
+        press(1, 27)                                      # Esc
+        wait_for(lambda: blue_at("menu-closed", *right), 10, "the menu to close")
+        # (A dead bridge takes the windows with it, and the steps below need them.)
+        check(blue_at("menu-closed", *left), "closing the menu took the window away")
+
+        # An item in the menu works: "New tab" covers the page, and Ctrl+W brings it back.
+        mouse = Pointer()
+        mouse.click(cols[-1] - 24, red_rows[0] - 26)
+        wait_for(lambda: not blue_at("menu-again", *right), 10, "the menu to open again")
+        mouse.click(cols[-1] - 300, red_rows[0] + 22)
+        mouse.close()
+        wait_for(lambda: on_screen(s, BLUE, "new-tab") < 1000, 10, "the menu's New tab to open one")
+        check(on_screen(s, GREEN, "new-tab") < 1000, "the menu had closed: its item's click went through to the page")
+        press(17, ord("w"), 2)
+        wait_for(lambda: on_screen(s, BLUE, "tab-closed") > 5000, 10, "Ctrl+W to close the new tab")
+
+        # A click lands exactly under the pointer. Chromium's buffer includes its shadow,
+        # and positions must count from there: every click was once 16 pixels to the left.
+        coords = os.path.join(s.home, "coords.html")
+        with open(coords, "w") as f:
+            f.write("""<!doctype html><title>Coordinates</title><body style="margin:0;height:100vh;background:rgb(1,2,3)"><script>
+addEventListener("mousedown", e => document.body.style.background =
+    `rgb(${e.clientX >> 8},${e.clientX & 255},${e.clientY & 255})`);
+</script>""")
+        launch_with_file("com.freebsdx.browser", coords)
+        wait_for(lambda: on_screen(s, (1, 2, 3), "coords") > 5000, 30, "the coordinates page")
+        at_x, at_y = cols[0] + 300, red_rows[0] + 150
+        mouse = Pointer()
+        mouse.click(at_x, at_y)
+        mouse.close()
+        expected = ((300 >> 8), 300 & 255, 150)
+        wait_for(lambda: on_screen(s, expected, "coords-hit") > 5000, 10,
+                 f"a click to report exactly {expected}")
+        press(17, ord("w"), 2)                            # back to the page before it
+
+        second = os.path.join(s.home, "second.html")
+        with open(second, "w") as f:
+            f.write("""<!doctype html><title>Second page</title><body style="margin:0;height:100vh;background:rgb(200,40,200)">
+<input autofocus oninput="if (this.value == 'abc') document.body.style.background = 'rgb(40,200,200)'">
+<script>addEventListener("keydown", e => { if (e.ctrlKey && e.key == "b") document.body.style.background = "rgb(230,180,30)"; });</script>""")
+        launch_with_file("com.freebsdx.browser", second)
+        wait_for(lambda: on_screen(s, (200, 40, 200), "second") > 5000, 30, "the second page")
+        time.sleep(1)
+        for code, ch in ((30, "a"), (48, "b"), (46, "c")):
+            press(code, ord(ch))
+        wait_for(lambda: on_screen(s, (40, 200, 200), "typed-text") > 5000, 10, "typed text to reach a field")
+        press(48, ord("b"), 2)                            # Ctrl+B: read with its modifier, not the next key's
+        wait_for(lambda: on_screen(s, (230, 180, 30), "shortcut") > 5000, 10, "a Ctrl shortcut to reach the page")
+        keys.close()
+        check(sum(1 for line in subprocess.run(["pgrep", "-f", "type=renderer"], capture_output=True, text=True).stdout.splitlines()) >= 1,
+              "no page process running")
+
+        # The window's close button closes it: the browser goes away.
+        chrome = lambda: subprocess.run(["pgrep", "-f", "ozone-platform=wayland"], capture_output=True, text=True).stdout.split()
+        check(chrome(), "the browser isn't running before closing")
+        mouse = Pointer()
+        mouse.click(cols[0] + 13, window_top(ppm, cols[0], red_rows[0]))
+        mouse.close()
+        wait_for(lambda: not chrome(), 20, "the close button to end the browser")
+        wait_for(lambda: on_screen(s, (230, 180, 30), "closed") < 100, 5, "the closed window to leave the screen")
+
+    # The compositor is gone, so the bridge has nothing to serve. (It used to stay,
+    # using a whole CPU core, until someone noticed.)
+    wait_for(lambda: subprocess.run(["pgrep", "-x", "xwayland-bridge"], capture_output=True).returncode != 0,
+             5, "the Wayland bridge to exit with the compositor")
 
 
 def s_persistence(work):
@@ -1784,6 +1970,7 @@ SCENARIOS = {
     "mail": s_mail,
     "sandbox-audit": s_sandbox_audit,
     "app-paths": s_app_paths,
+    "browser": s_browser,
     "replies": s_replies,
     "window-chrome": s_window_chrome,
     "persistence": s_persistence,
@@ -1901,7 +2088,8 @@ def main():
             print(f"  FAIL  {name:18} {time.time() - t0:5.1f}s  {e}")
         except Exception as e:   # a broken scenario shouldn't hide the others
             failed += 1
-            print(f"  ERROR {name:18} {type(e).__name__}: {e}")
+            where = traceback.extract_tb(e.__traceback__)[-1]
+            print(f"  ERROR {name:18} {type(e).__name__}: {e} (line {where.lineno})")
     if args.shots:
         try:
             take_shots(work, args.shots)
