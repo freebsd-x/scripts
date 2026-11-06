@@ -1055,6 +1055,168 @@ h1{margin:20px 0;color:rgb(10,10,10)}img{display:block;margin-top:10px}</style>
         p.terminate()
 
 
+class FakeWebServer:
+    """A small website on this machine, and a record of what was asked for."""
+
+    def __init__(self):
+        import http.server
+        outer = self
+        self.requests = []
+        png = os.path.join(tempfile.mkdtemp(prefix="fbx-web."), "dot.png")
+        write_png(png, 64, 64, (40, 200, 40))
+        dot = open(png, "rb").read()
+        box = lambda colour, h=100, more="": f"display:block;width:300px;height:{h}px;background:rgb({colour});{more}"
+        pages = {
+            "/first": ("text/html", f"""<!doctype html><title>First</title><link rel=stylesheet href=/s.css>
+                <link rel=stylesheet href=/l.css?{'x' * 600}>
+                <body style="margin:0;background:rgb(240,240,240)"><a id=go href=/second style="{box('220,40,40')}"></a>
+                <div id=long></div>
+                <div id=linked></div><img src=/dot.png style=display:block>""".encode()),
+            "/second": ("text/html", f"""<!doctype html><title>Second</title>
+                <body style="margin:0;background:rgb(240,240,240)"><a href=/moved style="{box('40,40,220')}"></a>""".encode()),
+            "/third": ("text/html", f"""<!doctype html><title>Third</title>
+                <body style="margin:0;background:rgb(240,240,240)"><a href=#far style="{box('140,40,180')}"></a>
+                <div id=far style="{box('20,180,180', 100, 'margin-top:3000px')}"></div>""".encode()),
+            "/s.css": ("text/css", f"#linked{{{box('230,130,20', 40, 'width:80px')}}}".encode()),
+            "/l.css": ("text/css", f"#long{{{box('250,240,100', 30, 'width:90px')}}}".encode()),
+            "/dot.png": ("image/png", dot),
+            "/plain": ("text/plain", b"plain <b>text</b>"),
+        }
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.requests.append(self.path)
+                if self.path.startswith("/l.css?"):   # an address too long for a message
+                    self.path = "/l.css"
+                if self.path == "/moved":
+                    self.send_response(302)
+                    self.send_header("Location", "/third")
+                    self.end_headers()
+                    return
+                if self.path in pages:
+                    kind, body = pages[self.path]
+                    self.send_response(200)
+                else:
+                    kind, body = "text/html", f"""<!doctype html><title>Gone</title><body style=margin:0><div style="{box('200,40,160')}"></div>""".encode()
+                    self.send_response(404)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def s_webnav(work):
+    """Our web engine browses: pages, stylesheets and images come through the sandbox's
+    broker, links and redirects are followed, history and the address bar work. Nothing
+    can reach this machine's own services unless a test asks, and nobody else may browse."""
+    RED, BLUE, GREEN, ORANGE = (220, 40, 40), (40, 40, 220), (40, 200, 40), (230, 130, 20)
+    PURPLE, TEAL, PINK = (140, 40, 180), (20, 180, 180), (200, 40, 160)
+    site = FakeWebServer()
+    url = lambda path: f"http://127.0.0.1:{site.port}{path}"
+    SCAN = dict(zip("abcdefghijklmnopqrstuvwxyz", [30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44]))
+    try:
+        # Unless told otherwise, a page can't reach this machine.
+        with Session(work, "webnav-private") as s:
+            s.shell()
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), url("/first")])
+            wait_for(lambda: "Capsicum sandbox active" in s.read_log("xwebview"), 20, "the browser to enter its sandbox")
+            time.sleep(4 * TIME_SCALE)
+            check(on_screen(s, RED, "private") == 0, "a page was fetched from this machine")
+            check(not site.requests, f"the local server was reached: {site.requests}")
+            # And nobody but the browser may ask for the web at all.
+            payload = struct.pack("<I", 1) + url("/first").encode().ljust(252, b"\0")
+            reply = call("com.freebsdx.Fetch", 0x01, payload)
+            check(reply is not None and struct.unpack("<i", reply[44:48])[0] == 1, "another client was allowed to browse")
+            payload = struct.pack("<I", 0) + url("/first").encode().ljust(252, b"\0")
+            reply = call("com.freebsdx.Fetch", 0x01, payload)
+            check(reply is not None and struct.unpack("<i", reply[44:48])[0] == 1, "another client fetched an unlisted host")
+            check(not site.requests, f"the local server was reached by a client: {site.requests}")
+            p.terminate()
+
+        os.environ["FBX_TEST_WEB_LOCAL"] = "1"
+        with Session(work, "webnav") as s:
+            s.shell()
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), url("/first")])
+            wait_for(lambda: on_screen(s, RED, "first") > 1000, 30, "the first page")
+            wait_for(lambda: on_screen(s, GREEN, "image") > 500, 20, "its image")
+            check(on_screen(s, ORANGE, "linked") > 500, "its stylesheet didn't apply")
+            check(on_screen(s, (250, 240, 100), "long") > 300, "the stylesheet with a long address didn't apply")
+            check(site.requests[:1] == ["/first"], f"odd requests: {site.requests}")
+            check("Capsicum sandbox active" in s.read_log("xwebview"), "the browser isn't sandboxed")
+
+            keys = connect()
+            def press(code, ch=0, mods=0):
+                for state in (1, 0):
+                    keys.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, struct.pack(INPUT_FMT, 2, code, state, mods, ch)))
+                    time.sleep(0.06)
+
+            def spot(rgb, tag):
+                """Somewhere in the middle of a colour's pixels."""
+                on_screen(s, rgb, tag)
+                parts = open(os.path.join(s.logs, tag + ".ppm"), "rb").read().split(b"\n", 3)
+                w, h = map(int, parts[1].split())
+                xs, ys = [], []
+                for y in range(0, h, 2):
+                    row = parts[3][y * w * 3:(y + 1) * w * 3]
+                    for x in range(0, w, 2):
+                        if all(abs(row[x * 3 + i] - rgb[i]) < 8 for i in range(3)):
+                            xs.append(x)
+                            ys.append(y)
+                check(xs, f"no {rgb} on screen to click")
+                return (min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2
+
+            # A link. Clicking it has to find the right place on the page, settled.
+            time.sleep(0.5)
+            mouse = Pointer()
+            mouse.click(*spot(RED, "aim"))
+            wait_for(lambda: on_screen(s, BLUE, "second") > 1000, 15, "the link to the second page")
+            check(on_screen(s, RED, "second-red") == 0, "the old page is still showing")
+
+            # History, by keyboard
+            press(105, 0, 4)   # Alt+Left
+            wait_for(lambda: on_screen(s, RED, "back") > 1000, 15, "Back to the first page")
+            press(106, 0, 4)   # Alt+Right
+            wait_for(lambda: on_screen(s, BLUE, "forward") > 1000, 15, "Forward to the second page")
+
+            # A redirect, then a link within the page.
+            mouse.click(*spot(BLUE, "aim2"))
+            wait_for(lambda: on_screen(s, PURPLE, "third") > 1000, 15, "the redirect to the third page")
+            check("/moved" in site.requests and "/third" in site.requests, f"odd requests: {site.requests}")
+            check(on_screen(s, TEAL, "not-yet") == 0, "the far box shows before following #far")
+            before = len(site.requests)
+            mouse.click(*spot(PURPLE, "aim3"))
+            wait_for(lambda: on_screen(s, TEAL, "fragment") > 1000, 15, "the in-page link to scroll")
+            check(len(site.requests) == before, "an in-page link fetched something")
+            mouse.close()
+
+            # A page that isn't there still shows what the site sent, and typing an address
+            # takes us there: Ctrl+L selects what's in the field, so typing replaces it.
+            press(SCAN["l"], ord("l"), 2)
+            time.sleep(0.2)
+            for c in url("/nothing"):
+                press(SCAN.get(c, 2), ord(c))
+            press(28, 13)
+            wait_for(lambda: on_screen(s, PINK, "notfound") > 1000, 15, "the typed address's 404 page")
+            check("/nothing" in site.requests, f"odd requests: {site.requests}")
+
+            keys.close()
+            p.terminate()
+    finally:
+        os.environ.pop("FBX_TEST_WEB_LOCAL", None)
+        site.close()
+
+
 def s_replies(work):
     """Requests get answered: a service's reply carries the request's id (a client
     waits on that id, and a reply without it never reaches the waiting code), one
@@ -2036,6 +2198,7 @@ SCENARIOS = {
     "app-paths": s_app_paths,
     "browser": s_browser,
     "webview": s_webview,
+    "webnav": s_webnav,
     "replies": s_replies,
     "window-chrome": s_window_chrome,
     "persistence": s_persistence,
