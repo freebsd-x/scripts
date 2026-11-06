@@ -15,13 +15,22 @@ TOOL = os.path.join(ROOT, "out", "sdk", "xweb", "xweb_layout")
 PROBE = """<script>addEventListener('load',()=>{const o=[];
 for(const e of document.querySelectorAll('html,html *')){const s=getComputedStyle(e);
 if(s.display==='none'||s.display==='inline'||s.display==='contents')continue;const n=e.tagName.toLowerCase();if(n==='script')continue;
-const r=e.getBoundingClientRect();o.push([n,r.x,r.y,r.width,r.height])}
-const p=document.createElement('pre');p.id='__xweb';p.textContent=JSON.stringify(o);p.style.display='none';document.documentElement.appendChild(p)})</script>"""
+if(!e.getClientRects().length)continue;const r=e.getBoundingClientRect();o.push([n,r.x,r.y,r.width,r.height])}
+o.push(['#viewport',innerWidth,innerHeight,0,0]);const p=document.createElement('pre');p.id='__xweb';p.textContent=JSON.stringify(o);p.style.display='none';document.documentElement.appendChild(p)})</script>"""
 
 
 def chromium_boxes(page, width, height, work):
+    # Its stylesheets and images still load from where the page really is; its scripts
+    # are dropped, since we don't run any.
     src = open(page, "rb").read().decode("utf-8", "replace")
-    probed = os.path.join(work, os.path.basename(page))
+    src = re.sub(r"<script\b.*?</script\s*>", "", src, flags=re.S | re.I)
+    base = '<base href="file://%s/">' % os.path.dirname(os.path.abspath(page))
+    src, n = re.subn(r"(<head\b[^>]*>)", lambda m: m.group(1) + base, src, count=1, flags=re.I)
+    if not n:
+        src, n = re.subn(r"(<!doctype[^>]*>)", lambda m: m.group(1) + base, src, count=1, flags=re.I)
+        if not n:
+            src = base + src
+    probed = os.path.join(work, "probe.html")
     with open(probed, "w") as f:
         f.write(src + PROBE)
     chrome = shutil.which("chrome") or shutil.which("chromium")
@@ -85,8 +94,9 @@ def main():
         for page in a.pages:
             name = os.path.basename(page)
             try:
-                bad, n = compare(our_boxes(page, a.width, a.height), chromium_boxes(page, a.width, a.height, work),
-                                 a.tolerance, a.v, name)
+                theirs = chromium_boxes(page, a.width, a.height, work)
+                viewport = theirs.pop()
+                bad, n = compare(our_boxes(page, viewport[1], viewport[2]), theirs, a.tolerance, a.v, name)
             except (RuntimeError, subprocess.TimeoutExpired) as e:
                 print(f"  ERROR {name}: {e}")
                 wrong += 1
