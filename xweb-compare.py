@@ -12,6 +12,7 @@ import argparse, html, json, os, re, shutil, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "out", "sdk", "xweb", "xweb_layout")
+FONTS = os.path.join(ROOT, "sdk", "xweb", "tests", "pages", "fonts")
 PROBE = """<script>addEventListener('load',()=>{const o=[];
 for(const e of document.querySelectorAll('html,html *')){const s=getComputedStyle(e);
 if(s.display==='none'||s.display==='inline'||s.display==='contents')continue;const n=e.tagName.toLowerCase();if(n==='script')continue;
@@ -88,6 +89,9 @@ def main():
     ap.add_argument("-v", action="store_true")
     ap.add_argument("pages", nargs="+")
     a = ap.parse_args()
+    # The web font page's fonts aren't kept in the repository, only made from installed ones.
+    if any(os.path.basename(p) == "webfont.html" for p in a.pages) and not os.path.isdir(FONTS):
+        subprocess.run([sys.executable, "-I", os.path.join(os.path.dirname(FONTS), "..", "make_webfonts.py"), FONTS], check=True)
     work = tempfile.mkdtemp(prefix="xweb-compare.")
     total = wrong = 0
     try:

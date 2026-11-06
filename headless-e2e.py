@@ -21,6 +21,7 @@ Standard library only. Uses netpbm (pnmtopng, pnmcut, pnmscale, pnmcat) for
 """
 
 import argparse
+import base64
 import wave
 import ssl
 import os
@@ -1058,10 +1059,11 @@ h1{margin:20px 0;color:rgb(10,10,10)}img{display:block;margin-top:10px}</style>
 class FakeWebServer:
     """A small website on this machine, and a record of what was asked for."""
 
-    def __init__(self):
+    def __init__(self, extra=None, delays=None):
         import http.server
         outer = self
         self.requests = []
+        delays = delays or {}
         png = os.path.join(tempfile.mkdtemp(prefix="fbx-web."), "dot.png")
         write_png(png, 64, 64, (40, 200, 40))
         dot = open(png, "rb").read()
@@ -1082,10 +1084,12 @@ class FakeWebServer:
             "/dot.png": ("image/png", dot),
             "/plain": ("text/plain", b"plain <b>text</b>"),
         }
+        pages.update(extra or {})
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 outer.requests.append(self.path)
+                time.sleep(delays.get(self.path, 0))
                 if self.path.startswith("/l.css?"):   # an address too long for a message
                     self.path = "/l.css"
                 if self.path == "/moved":
@@ -1114,6 +1118,137 @@ class FakeWebServer:
     def close(self):
         self.server.shutdown()
         self.server.server_close()
+
+
+def s_webfont(work):
+    """A page's own fonts come through the sandbox: text shows at once in another font, then
+    takes the web font's shape when it arrives. Only what the text needs is fetched, a bad
+    source falls through to the next, and a page doesn't get another page's fonts."""
+    RED, BLUE, TEAL = (220, 40, 40), (40, 40, 220), (20, 180, 180)
+    fonts = os.path.join(work, "webfonts")
+    subprocess.run([sys.executable, "-I", os.path.join(ROOT, "sdk/xweb/tests/make_webfonts.py"), fonts], check=True)
+    read = lambda name: open(os.path.join(fonts, name), "rb").read()
+    inline = base64.b64encode(read("serif.woff")).decode()
+    rules = """@font-face{font-family:Web;src:url(/broken.woff2) format("woff2"),url(/mono.woff) format("woff")}
+        @font-face{font-family:Web;src:url(/hangul.woff);unicode-range:U+AC00-D7A3}
+        @font-face{font-family:Hidden;src:url(/hidden.woff)}
+        @font-face{font-family:Unused;src:url(/unused.woff)}
+        @font-face{font-family:Inline;src:url(data:font/woff;base64,%s)}""" % inline
+    style = "body{margin:0;background:rgb(240,240,240);font:40px sans-serif}div{display:block;width:max-content;color:white}"
+    page = lambda link: f"""<!doctype html><title>Fonts</title><style>{rules}{style}</style>
+        <div id=a style="background:rgb(220,40,40);font-family:Web,sans-serif">MMMMMMMM</div>
+        <div id=b style="background:rgb(40,40,220);font-family:Inline,sans-serif">MMMMMMMM</div>
+        <div style="display:none;font-family:Hidden">not shown</div>
+        <a href={link} style="display:block;width:300px;height:80px;background:rgb(20,180,180)"></a>""".encode()
+    plain = f"""<!doctype html><title>Plain</title><style>{style}</style>
+        <div style="background:rgb(220,40,40);font-family:Web,sans-serif">MMMMMMMM</div>""".encode()
+    site = FakeWebServer(
+        extra={
+            "/fonts": ("text/html", page("/again")),
+            "/again": ("text/html", page("/plain-page")),
+            "/plain-page": ("text/html", plain),
+            "/broken.woff2": ("font/woff2", b"this is not a font at all"),
+            "/mono.woff": ("font/woff", read("mono-bold.woff")),
+        },
+        delays={"/mono.woff": 4 * TIME_SCALE},
+    )
+    url = lambda path: f"http://127.0.0.1:{site.port}{path}"
+
+    # What layout says those lines should measure, with the fonts as plain files.
+    probe = os.path.join(fonts, "probe.html")
+    with open(probe, "w") as f:
+        f.write(f"""<!doctype html><style>@font-face{{font-family:Web;src:url(mono-bold.woff)}}
+            @font-face{{font-family:Inline;src:url(serif.woff)}}{style}</style>
+            <div style="font-family:Web">MMMMMMMM</div><div style="font-family:Inline">MMMMMMMM</div>""")
+    tool = subprocess.run([os.path.join(OUT, "sdk/xweb/xweb_layout"), probe, "800", "600"], capture_output=True, text=True, check=True).stdout
+    widths = [float(line.split()[3]) for line in tool.splitlines() if line.startswith("div ")]
+    check(len(widths) == 2 and abs(widths[0] - widths[1]) > 20, f"the two test fonts aren't different enough: {widths}")
+    want_mono, want_serif = widths
+    # Eight letters of a font whose every letter is 0.6em: a fallback wouldn't come to this.
+    check(abs(want_mono - 8 * 0.6 * 40) < 2, f"the font didn't load: {want_mono} wide")
+
+    def extent(s, rgb, tag):
+        """How wide a colour runs on screen, and how many pixels inside it aren't that colour."""
+        on_screen(s, rgb, tag)
+        parts = open(os.path.join(s.logs, tag + ".ppm"), "rb").read().split(b"\n", 3)
+        w, h = map(int, parts[1].split())
+        data = parts[3]
+        near = lambda x, y, c: all(abs(data[(y * w + x) * 3 + i] - c[i]) < 8 for i in range(3))
+        xs, ys = [], []
+        for y in range(0, h, 2):
+            for x in range(0, w):
+                if near(x, y, rgb):
+                    xs.append(x)
+                    ys.append(y)
+        if not xs:
+            return 0, 0
+        lit = 0
+        for y in range(min(ys), max(ys) + 1):
+            for x in range(min(xs), max(xs) + 1):
+                if all(data[(y * w + x) * 3 + i] > 200 for i in range(3)):
+                    lit += 1
+        return max(xs) - min(xs) + 1, lit
+
+    try:
+        os.environ["FBX_TEST_WEB_LOCAL"] = "1"
+        with Session(work, "webfont") as s:
+            s.shell()
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), url("/fonts")])
+            wait_for(lambda: on_screen(s, RED, "first") > 1000, 30, "the page")
+            check("Capsicum sandbox active" in s.read_log("xwebview"), "the browser isn't sandboxed")
+
+            # The font is still on its way: the text is up in another one.
+            early, early_lit = extent(s, RED, "early")
+            check(abs(early - want_mono) > 10, f"the line is already {early} wide with the font still on its way")
+            check(early_lit > 200, f"no text showing while the font loads ({early_lit} pixels)")
+            # The one in the stylesheet itself is decoded at once, and it isn't the fallback.
+            wait_for(lambda: abs(extent(s, BLUE, "inline")[0] - want_serif) < 4, 15, f"the inline font: want {want_serif} wide")
+            # Then it arrives, and the page reflows and draws with it.
+            wait_for(lambda: abs(extent(s, RED, "swap")[0] - want_mono) < 4, 30, f"the font to arrive: want {want_mono} wide")
+            late_lit = extent(s, RED, "late")[1]
+            check(late_lit > 200, f"the web font drew nothing ({late_lit} pixels)")
+            check(late_lit != early_lit, "the text looks the same in both fonts")
+
+            check("/broken.woff2" in site.requests, f"the first source wasn't tried: {site.requests}")
+            check(site.requests.index("/broken.woff2") < site.requests.index("/mono.woff"), f"sources out of order: {site.requests}")
+            for name in ("/hangul.woff", "/hidden.woff", "/unused.woff"):
+                check(name not in site.requests, f"{name} was fetched with no text needing it")
+
+            # The next page using it doesn't fetch it again, and has it from its first frame.
+            def aim():
+                on_screen(s, TEAL, "aim")
+                parts = open(os.path.join(s.logs, "aim.ppm"), "rb").read().split(b"\n", 3)
+                w, h = map(int, parts[1].split())
+                xs, ys = [], []
+                for y in range(0, h, 2):
+                    row = parts[3][y * w * 3:(y + 1) * w * 3]
+                    for x in range(0, w, 2):
+                        if all(abs(row[x * 3 + i] - TEAL[i]) < 8 for i in range(3)):
+                            xs.append(x)
+                            ys.append(y)
+                check(xs, "no link to click")
+                return (min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2
+
+            mouse = Pointer()
+            time.sleep(0.5)
+            mouse.click(*aim())
+            wait_for(lambda: "/again" in site.requests, 15, "the link to the second page")
+            wait_for(lambda: abs(extent(s, RED, "again")[0] - want_mono) < 4 and on_screen(s, TEAL, "again-teal") > 1000, 15, "the second page in the font")
+            check(site.requests.count("/mono.woff") == 1, f"a font was fetched twice: {site.requests}")
+
+            # A page that didn't ask for it doesn't get it, whatever it calls its fonts.
+            time.sleep(0.5)
+            mouse.click(*aim())
+            wait_for(lambda: "/plain-page" in site.requests, 15, "the link to the third page")
+            wait_for(lambda: on_screen(s, TEAL, "gone-teal") == 0 and on_screen(s, RED, "plain") > 1000, 15, "the third page")
+            plain_w = extent(s, RED, "plain-w")[0]
+            check(abs(plain_w - want_mono) > 10, f"a page got another page's font: {plain_w} wide")
+            check(abs(plain_w - early) < 4, f"the third page's fallback is {plain_w} wide, not {early}")
+            mouse.close()
+            p.terminate()
+    finally:
+        os.environ.pop("FBX_TEST_WEB_LOCAL", None)
+        site.close()
 
 
 def s_webnav(work):
@@ -2199,6 +2334,7 @@ SCENARIOS = {
     "browser": s_browser,
     "webview": s_webview,
     "webnav": s_webnav,
+    "webfont": s_webfont,
     "replies": s_replies,
     "window-chrome": s_window_chrome,
     "persistence": s_persistence,
