@@ -48,7 +48,7 @@ RENDER_MSG_SIZE = 56
 
 # Protocol constants (include/shared/protocol.h).
 SURFACE_CREATED, SURFACE_CLOSED, SHELL_SURFACE_CREATED = 0, 2, 3
-INPUT_MOUSE_MOVE, INPUT_MOUSE_BUTTON = 0, 1
+INPUT_MOUSE_MOVE, INPUT_MOUSE_BUTTON, INPUT_MOUSE_WHEEL = 0, 1, 3
 BTN_LEFT = 272
 HEADLESS_INJECT = 3
 SHELL_LAUNCH_WITH_FILE = 5
@@ -989,6 +989,70 @@ class Watcher:
     def close(self):
         self.s.shutdown(socket.SHUT_RDWR)
         self.s.close()
+
+
+def s_webview(work):
+    """Our own web engine draws a page in a window, inside the sandbox: layout lands
+    on the exact pixels, images show, what's below the window scrolls into view."""
+    with Session(work, "webview") as s:
+        s.shell()
+        pagedir = os.path.join(work, "webview-page")
+        os.makedirs(pagedir, exist_ok=True)
+        write_png(os.path.join(pagedir, "dot.png"), 64, 64, (40, 200, 40))
+        with open(os.path.join(pagedir, "style.css"), "w") as f:
+            f.write("#linked { width: 80px; height: 40px; background: rgb(230, 130, 20); }")
+        with open(os.path.join(pagedir, "page.html"), "w") as f:
+            f.write("""<!doctype html><title>t</title><link rel=stylesheet href=style.css>
+<style>body{margin:0;background:rgb(240,240,240);--c:rgb(220,40,40)}
+#r{width:200px;height:100px;background:var(--c);margin:30px 0 0 40px}
+#b{height:60px;width:300px;background:rgb(40,40,220);margin-top:3000px}
+h1{margin:20px 0;color:rgb(10,10,10)}img{display:block;margin-top:10px}</style>
+<div id=r></div><img src=dot.png><div id=linked></div><h1>Heading</h1><div id=b></div>""")
+        p = s.start("xwebview", [os.path.join(OUT, "xwebview"), os.path.join(pagedir, "page.html")])
+        wait_for(lambda: on_screen(s, (220, 40, 40), "red") > 1000, 20, "the page's first box on screen")
+        size = [0]
+        def settled():
+            now = on_screen(s, (220, 40, 40), "red")
+            same = now == size[0]
+            size[0] = now
+            return same
+        wait_for(settled, 10, "the window to finish opening")
+        check("Capsicum sandbox active" in s.read_log("xwebview"), "the viewer isn't sandboxed")
+
+        ppm = open(os.path.join(s.logs, "red.ppm"), "rb").read().split(b"\n", 3)
+        w, h = map(int, ppm[1].split())
+        def find(rgb):
+            """Top-left of a colour's pixels."""
+            xs, ys = [], []
+            for y in range(h):
+                row = ppm[3][y * w * 3:(y + 1) * w * 3]
+                for x in range(0, w):
+                    if all(abs(row[x * 3 + i] - rgb[i]) < 8 for i in range(3)):
+                        xs.append(x)
+                        ys.append(y)
+            return (min(xs), min(ys), len(xs)) if xs else None
+        red, green, orange = find((220, 40, 40)), find((40, 200, 40)), find((230, 130, 20))
+        check(red and red[2] == 200 * 100, f"the 200x100 box covers {red}")
+        check(green and green[2] == 64 * 64, f"the 64x64 image isn't whole: {green}")
+        check(orange and orange[2] == 80 * 40, f"the linked stylesheet didn't apply: {orange}")
+        # The window's left edge is 40px left of the box (its margin), and so everything
+        # else is placed from there.
+        left = red[0] - 40
+        check(green[0] == left and green[1] == red[1] + 100 + 10, f"the image is at {green[:2]}, the box at {red[:2]}")
+        check(orange[0] == left and orange[1] == green[1] + 64, f"the linked box is at {orange[:2]}, the image at {green[:2]}")
+        check(on_screen(s, (10, 10, 10), "text") > 50, "the heading's text isn't drawn")
+        check(on_screen(s, (40, 40, 220), "before") == 0, "the far box shows before scrolling")
+
+        # A wheel brings the rest of the page into view.
+        mouse = Pointer()
+        mouse._inject(INPUT_MOUSE_MOVE, -10000, -10000)
+        mouse._inject(INPUT_MOUSE_MOVE, left + 400, red[1] + 200)
+        def scroll_on():
+            mouse._inject(INPUT_MOUSE_WHEEL, 0, 3)
+            return on_screen(s, (40, 40, 220), "scrolled") > 100
+        wait_for(scroll_on, 60, "the far box to scroll into view")
+        mouse.close()
+        p.terminate()
 
 
 def s_replies(work):
@@ -1971,6 +2035,7 @@ SCENARIOS = {
     "sandbox-audit": s_sandbox_audit,
     "app-paths": s_app_paths,
     "browser": s_browser,
+    "webview": s_webview,
     "replies": s_replies,
     "window-chrome": s_window_chrome,
     "persistence": s_persistence,
