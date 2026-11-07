@@ -1120,6 +1120,65 @@ class FakeWebServer:
         self.server.server_close()
 
 
+def s_webpaint(work):
+    """What a page draws besides boxes and text comes through the sandbox: gradients, SVG
+    inline and as files, CSS images from a stylesheet's own folder, and masks. A box that
+    clips its overflow clips its positioned children too."""
+    RED, BLUE, GREEN, YELLOW = (220, 40, 40), (40, 40, 220), (20, 180, 60), (250, 200, 0)
+    PURPLE, ORANGE, CYAN, PINK = (160, 40, 200), (255, 120, 0), (0, 200, 200), (230, 60, 150)
+    rgb = lambda c: "rgb(%d,%d,%d)" % c
+    svg = lambda body, size="width='20' height='20'": ("image/svg+xml", f"<svg xmlns='http://www.w3.org/2000/svg' {size}>{body}</svg>".encode())
+    page = f"""<!doctype html><title>Paint</title><link rel=stylesheet href=/css/site.css>
+        <style>body{{margin:0;background:rgb(240,240,240)}}div{{margin:0 0 10px 10px}}</style>
+        <div style="width:300px;height:100px;background:linear-gradient(90deg,{rgb(RED)} 0 50%,{rgb(BLUE)} 50% 100%)"></div>
+        <svg width=120 height=120 viewBox="0 0 10 10" style="color:{rgb(GREEN)};margin-left:10px"><circle cx=5 cy=5 r=5 fill=currentColor /></svg>
+        <div style="width:200px;height:80px;background:url(/tile.svg)"></div>
+        <div style="width:100px;height:100px;background:{rgb(PURPLE)};mask:url(/mask.svg) no-repeat center/contain;-webkit-mask:url(/mask.svg) no-repeat center/contain"></div>
+        <img src=/logo.svg width=60 height=60 style="margin-left:10px">
+        <div style="position:relative;overflow:hidden;width:100px;height:40px"><div style="position:absolute;left:-100%;top:0;width:300%;height:100%;background:{rgb(CYAN)}"></div></div>
+        <div class=sheet></div>""".encode()
+    site = FakeWebServer(extra={
+        "/paint": ("text/html", page),
+        "/css/site.css": ("text/css", b".sheet{width:160px;height:60px;background:url(../img/bg.svg) 0 0/40px 30px}"),
+        "/img/bg.svg": svg(f"<rect width='20' height='20' fill='{rgb(PINK)}'/>"),
+        "/tile.svg": svg(f"<rect width='20' height='20' fill='{rgb(YELLOW)}'/>"),
+        "/mask.svg": svg("<circle cx='10' cy='10' r='10'/>"),
+        "/logo.svg": svg(f"<rect width='10' height='10' fill='{rgb(ORANGE)}'/>", "viewBox='0 0 10 10'"),
+    })
+    url = lambda path: f"http://127.0.0.1:{site.port}{path}"
+    # on_screen samples one pixel in four.
+    area = lambda w, h: w * h / 4
+    try:
+        os.environ["FBX_TEST_WEB_LOCAL"] = "1"
+        with Session(work, "webpaint") as s:
+            s.shell()
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), url("/paint")])
+            wait_for(lambda: on_screen(s, RED, "first") > 1000, 30, "the page")
+            check("Capsicum sandbox active" in s.read_log("xwebview"), "the browser isn't sandboxed")
+            # A gradient with a hard stop: half each.
+            red, blue = on_screen(s, RED, "red"), on_screen(s, BLUE, "blue")
+            check(abs(red - area(150, 100)) < area(150, 100) * 0.15 and abs(blue - area(150, 100)) < area(150, 100) * 0.15,
+                  f"the gradient's halves: {red} red, {blue} blue, want about {area(150, 100):.0f} each")
+            # Inline SVG, in the colour its element has.
+            green = on_screen(s, GREEN, "green")
+            circle = 3.14159 * 60 * 60 / 4
+            check(abs(green - circle) < circle * 0.15, f"the inline SVG circle: {green} green, want about {circle:.0f}")
+            # Files: a tiled background, a mask, an <img>, each loaded once they're seen.
+            for name, colour, want in (("tile", YELLOW, area(200, 80)), ("logo", ORANGE, area(60, 60)), ("sheet", PINK, area(160, 60))):
+                wait_for(lambda: abs(on_screen(s, colour, name) - want) < want * 0.15, 20, f"{name}: about {want:.0f} pixels")
+            # Through a circular mask: a circle of the colour, not its square.
+            disc = 3.14159 * 50 * 50 / 4
+            wait_for(lambda: abs(on_screen(s, PURPLE, "mask") - disc) < disc * 0.15, 20, f"the masked colour as a disc of about {disc:.0f}")
+            # Relative to the stylesheet's folder, not the page's.
+            check("/img/bg.svg" in site.requests, f"the sheet's image wasn't fetched from beside it: {site.requests}")
+            # Overflow clips the positioned child: only the parent's 100x40 shows.
+            cyan = on_screen(s, CYAN, "cyan")
+            check(abs(cyan - area(100, 40)) < area(100, 40) * 0.2, f"the clipped child shows {cyan}, want about {area(100, 40):.0f}")
+            p.terminate()
+    finally:
+        os.environ.pop("FBX_TEST_WEB_LOCAL", None)
+
+
 def s_webfont(work):
     """A page's own fonts come through the sandbox: text shows at once in another font, then
     takes the web font's shape when it arrives. Only what the text needs is fetched, a bad
@@ -2335,6 +2394,7 @@ SCENARIOS = {
     "webview": s_webview,
     "webnav": s_webnav,
     "webfont": s_webfont,
+    "webpaint": s_webpaint,
     "replies": s_replies,
     "window-chrome": s_window_chrome,
     "persistence": s_persistence,
