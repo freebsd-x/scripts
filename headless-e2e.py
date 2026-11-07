@@ -2052,9 +2052,10 @@ def window_top(ppm, x, below_y):
 
 
 def s_browser(work):
-    """The Browser is real: Chromium, through the Wayland bridge, on this
-    compositor. It shows a page, the page gets the mouse and keyboard and keeps
-    drawing, it fits the screen, and it asks only for what it was told to open."""
+    """The Browser opens pages in our own engine, and hands one to Chromium when asked.
+    Chromium is real, through the Wayland bridge on this compositor: it shows a page,
+    the page gets the mouse and keyboard and keeps drawing, it fits the screen, and it
+    asks only for what it was told to open."""
     engine = "/usr/local/bin/chrome"
     if not os.access(engine, os.X_OK):
         print("  (chromium isn't installed: only the missing-engine message is checked)")
@@ -2062,7 +2063,7 @@ def s_browser(work):
     with Session(work, "browser", browser_engine=engine) as s:
         s.shell()
         # No engine: it says so, in a window.
-        none = AppDriver(s, "browser", env={"FBX_BROWSER_ENGINE": "/nonexistent"})
+        none = AppDriver(s, "browser", "chromium:/nonexistent.html", env={"FBX_BROWSER_ENGINE": "/nonexistent"})
         wait_for(lambda: any("isn't installed" in x for x in none.texts()), 10, "the missing-engine message")
         none.close()
         if not os.access(engine, os.X_OK):
@@ -2075,7 +2076,7 @@ def s_browser(work):
 addEventListener("mousedown", () => document.body.style.background = "rgb(40,200,40)");
 addEventListener("keydown",   () => document.body.style.background = "rgb(40,40,220)");
 </script>""")
-        launch_with_file("com.freebsdx.browser", page)
+        launch_with_file("com.freebsdx.browser", "chromium:" + page)
         wait_for(lambda: on_screen(s, RED, "page") > 5000, 60, "the page's pixels on screen")
         # The clicks below aim by this capture, so it has to show the window at rest,
         # not still animating open.
@@ -2167,7 +2168,7 @@ addEventListener("keydown",   () => document.body.style.background = "rgb(40,40,
 addEventListener("mousedown", e => document.body.style.background =
     `rgb(${e.clientX >> 8},${e.clientX & 255},${e.clientY & 255})`);
 </script>""")
-        launch_with_file("com.freebsdx.browser", coords)
+        launch_with_file("com.freebsdx.browser", "chromium:" + coords)
         wait_for(lambda: on_screen(s, (1, 2, 3), "coords") > 5000, 30, "the coordinates page")
         at_x, at_y = cols[0] + 300, red_rows[0] + 150
         mouse = Pointer()
@@ -2183,7 +2184,7 @@ addEventListener("mousedown", e => document.body.style.background =
             f.write("""<!doctype html><title>Second page</title><body style="margin:0;height:100vh;background:rgb(200,40,200)">
 <input autofocus oninput="if (this.value == 'abc') document.body.style.background = 'rgb(40,200,200)'">
 <script>addEventListener("keydown", e => { if (e.ctrlKey && e.key == "b") document.body.style.background = "rgb(230,180,30)"; });</script>""")
-        launch_with_file("com.freebsdx.browser", second)
+        launch_with_file("com.freebsdx.browser", "chromium:" + second)
         wait_for(lambda: on_screen(s, (200, 40, 200), "second") > 5000, 30, "the second page")
         time.sleep(1)
         for code, ch in ((30, "a"), (48, "b"), (46, "c")):
@@ -2203,6 +2204,42 @@ addEventListener("mousedown", e => document.body.style.background =
         mouse.close()
         wait_for(lambda: not chrome(), 20, "the close button to end the browser")
         wait_for(lambda: on_screen(s, (230, 180, 30), "closed") < 100, 5, "the closed window to leave the screen")
+
+        # A page opens in our engine, not Chromium; its button hands the page over.
+        ORANGE = (230, 120, 20)
+        ours = os.path.join(s.home, "ours.html")
+        with open(ours, "w") as f:
+            f.write('<!doctype html><title>Ours</title><body style="margin:0;height:100vh;background:rgb(230,120,20)">')
+        # Sandboxed, like the other built-in apps (it asks the shell for Chromium; it can't start it).
+        direct = AppDriver(s, "browser", ours)
+        wait_for(lambda: on_screen(s, ORANGE, "direct") > 5000, 30, "the page in our engine")
+        check("Capsicum sandbox active" in s.read_log("browser"), "the Browser isn't sandboxed")
+        direct.close()
+        wait_for(lambda: on_screen(s, ORANGE, "direct-gone") < 100, 10, "that window to close")
+        launch_with_file("com.freebsdx.browser", ours)
+        wait_for(lambda: on_screen(s, ORANGE, "ours") > 5000, 30, "the page in our engine")
+        check(not chrome(), "Chromium started for a page our engine can show")
+        check(procs_running(os.path.join(OUT, "browser")) == 1, "the Browser isn't what's showing the page")
+        o = open(os.path.join(s.logs, "ours.ppm"), "rb").read().split(b"\n", 3)
+        ow, oh = map(int, o[1].split())
+        near = lambda x, y: all(abs(o[3][(y * ow + x) * 3 + i] - ORANGE[i]) < 12 for i in range(3))
+        rows = [y for y in range(0, oh, 2) if any(near(x, y) for x in range(0, ow, 16))]
+        top = min(rows)
+        xs = [x for x in range(ow) if near(x, top + 4)]
+        mouse = Pointer()
+        mouse.click(max(xs) - 6 - 68, top - 22)            # "Open in Chromium", at the toolbar's right end
+        mouse.close()
+        wait_for(lambda: chrome(), 60, "Open in Chromium to start Chromium")
+        # Ours closed, the page still shows: Chromium has it.
+        subprocess.run(["pkill", "-f", "(^|/)out/browser( |$)"])
+        wait_for(lambda: procs_running(os.path.join(OUT, "browser")) == 0, 10, "our engine's window to close")
+        wait_for(lambda: on_screen(s, ORANGE, "in-chromium") > 5000, 60, "the page in Chromium")
+        for pid in chrome():
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        wait_for(lambda: not chrome(), 20, "Chromium to end")
 
     # The compositor is gone, so the bridge has nothing to serve. (It used to stay,
     # using a whole CPU core, until someone noticed.)
