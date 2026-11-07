@@ -1367,8 +1367,8 @@ def s_webcookies(work):
 
 def s_webscript(work):
     """A page's own JavaScript runs on our engine, sandboxed: it builds part of the page,
-    a click listener recolours a button, a timer fires, typing raises input events, and
-    a submit listener cancels the form's sending."""
+    a click listener recolours a button, a timer fires, typing raises input events that
+    regular expressions check, and a submit listener cancels the form's sending."""
     RED, GREEN, BLUE, PURPLE, YELLOW, ORANGE, CYAN = (220, 40, 40), (40, 200, 40), (40, 40, 220), (160, 40, 200), (250, 200, 0), (255, 120, 0), (0, 200, 200)
     rgb = lambda c: "rgb(%d,%d,%d)" % c
     page = f"""<!doctype html><title>Script</title><body style="margin:0;background:rgb(240,240,240)">
@@ -1384,7 +1384,10 @@ def s_webscript(work):
         document.getElementById('b').addEventListener('click', e => {{ e.target.style.background = '{rgb(BLUE)}'; }});
         setTimeout(() => {{ document.getElementById('later').style.background = '{rgb(PURPLE)}'; }}, 300);
         document.getElementById('q').addEventListener('input', e => {{
-            if (e.target.value === 'hi') document.getElementById('later').style.background = '{rgb(ORANGE)}';
+            // Checked with regular expressions, as pages check what's typed.
+            const v = e.target.value;
+            if (/^h[aeiou]$/i.test(v) && v.replace(/(h)(\\w)/, '$2$1') === 'ih' && 'a-b_c'.split(/[-_]/).length === 3)
+                document.getElementById('later').style.background = '{rgb(ORANGE)}';
         }});
         document.getElementById('f').addEventListener('submit', e => {{
             e.preventDefault();
