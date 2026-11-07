@@ -1063,6 +1063,7 @@ class FakeWebServer:
         import http.server
         outer = self
         self.requests = []
+        self.posts = []   # (path, content type, body) of each form sent
         delays = delays or {}
         png = os.path.join(tempfile.mkdtemp(prefix="fbx-web."), "dot.png")
         write_png(png, 64, 64, (40, 200, 40))
@@ -1097,6 +1098,8 @@ class FakeWebServer:
                     self.send_header("Location", "/third")
                     self.end_headers()
                     return
+                if self.path not in pages and self.path.split("?")[0] in pages:
+                    self.path = self.path.split("?")[0]   # a form's query: the page all the same
                 if self.path in pages:
                     kind, body = pages[self.path]
                     self.send_response(200)
@@ -1107,6 +1110,16 @@ class FakeWebServer:
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def do_POST(self):
+                # A form sent: noted, then off to a page of thanks, as sites do.
+                n = int(self.headers.get("Content-Length", "0") or 0)
+                outer.posts.append((self.path, self.headers.get("Content-Type", ""), self.rfile.read(n).decode("utf-8", "replace")))
+                outer.requests.append("POST " + self.path)
+                self.send_response(303)
+                self.send_header("Location", "/thanks")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
 
             def log_message(self, *args):
                 pass
@@ -1190,6 +1203,103 @@ def s_webpaint(work):
             check(abs(cyan - area(100, 40)) < area(100, 40) * 0.2, f"the clipped child shows {cyan}, want about {area(100, 40):.0f}")
             p.terminate()
     finally:
+        os.environ.pop("FBX_TEST_WEB_LOCAL", None)
+
+
+def s_webform(work):
+    """Forms work through the sandbox: typing into a field (Enter submits it), a label's
+    click ticking its checkbox, a submit button sending the form by GET, and a POST form
+    whose body reaches the site, which answers with a redirect that's followed."""
+    YELLOW, CYAN, RED, BLUE, GREEN = (250, 200, 0), (0, 200, 200), (220, 40, 40), (40, 40, 220), (40, 200, 40)
+    rgb = lambda c: "rgb(%d,%d,%d)" % c
+    block = lambda c, h: f"display:block;width:300px;height:{h}px;margin:0 0 10px 10px;border:0;background:{rgb(c)}"
+    form = f"""<!doctype html><title>Form</title><body style="margin:0;background:rgb(240,240,240)">
+        <form action=/results>
+          <input name=q style="{block(YELLOW, 40)};font-size:20px;color:black">
+          <label style="{block(CYAN, 40)}"><input type=checkbox name=agree> agree</label>
+          <select name=s><option>first<option>second</select>
+          <input type=submit name=go value=Go style="{block(RED, 50)}">
+        </form>
+        <form action=/send method=post>
+          <input name=msg style="{block(BLUE, 40)};color:white">
+          <input type=submit style="{block(GREEN, 50)}">
+        </form>""".encode()
+    done = lambda title: f"<!doctype html><title>{title}</title><body style='margin:0;background:rgb(240,240,240)'><p>{title}</p>".encode()
+    site = FakeWebServer(extra={"/form": ("text/html", form), "/results": ("text/html", done("Results")), "/thanks": ("text/html", done("Thanks"))})
+    url = lambda path: f"http://127.0.0.1:{site.port}{path}"
+
+    def centre(s, colour, tag):
+        on_screen(s, colour, tag)
+        parts = open(os.path.join(s.logs, tag + ".ppm"), "rb").read().split(b"\n", 3)
+        w, h = map(int, parts[1].split())
+        xs, ys = [], []
+        for y in range(0, h, 2):
+            row = parts[3][y * w * 3:(y + 1) * w * 3]
+            for x in range(0, w, 2):
+                if all(abs(row[x * 3 + i] - colour[i]) < 10 for i in range(3)):
+                    xs.append(x)
+                    ys.append(y)
+        check(xs, f"nothing {colour} on screen ({tag})")
+        return (min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2
+
+    keys = None
+    def press(code, ch=0, mods=0):
+        for state in (1, 0):
+            keys.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, struct.pack(INPUT_FMT, 2, code, state, mods, ch)))
+            time.sleep(0.05)
+    def type_text(text):
+        for ch in text:
+            press(57 if ch == " " else 30, ord(ch))
+
+    try:
+        os.environ["FBX_TEST_WEB_LOCAL"] = "1"
+        with Session(work, "webform") as s:
+            s.shell()
+            keys = connect()
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), url("/form")])
+            wait_for(lambda: on_screen(s, RED, "form") > 1000, 30, "the form")
+            mouse = Pointer()
+            # Type into the field, and Enter sends the form with its first button.
+            mouse.click(*centre(s, YELLOW, "field"))
+            time.sleep(0.3)
+            type_text("hi there")
+            press(28)
+            wait_for(lambda: any(r.startswith("/results?") for r in site.requests), 15, "Enter to send the form")
+            sent = [r for r in site.requests if r.startswith("/results?")][-1]
+            check(sent == "/results?q=hi+there&s=first&go=Go", f"the form sent {sent}")
+            wait_for(lambda: on_screen(s, RED, "results") == 0, 15, "the results page")
+
+            # Back to it, fresh: tick the box by its label, then the button sends it.
+            p.terminate()
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), url("/form")])
+            wait_for(lambda: on_screen(s, RED, "form-again") > 1000, 30, "the form again")
+            before = len(site.requests)
+            mouse.click(*centre(s, CYAN, "label"))
+            time.sleep(0.3)
+            mouse.click(*centre(s, RED, "button"))
+            wait_for(lambda: any(r.startswith("/results?") for r in site.requests[before:]), 15, "the button to send the form")
+            sent = [r for r in site.requests[before:] if r.startswith("/results?")][-1]
+            check(sent == "/results?q=&agree=on&s=first&go=Go", f"the form sent {sent}")
+
+            # A POST form: its body reaches the site, and the redirect after it is followed.
+            p.terminate()
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), url("/form")])
+            wait_for(lambda: on_screen(s, GREEN, "post-form") > 1000, 30, "the form a third time")
+            mouse.click(*centre(s, BLUE, "msg"))
+            time.sleep(0.3)
+            type_text("x y&z")
+            mouse.click(*centre(s, GREEN, "send"))
+            wait_for(lambda: site.posts, 15, "the POST")
+            path, kind, body = site.posts[-1]
+            check(path == "/send" and kind == "application/x-www-form-urlencoded" and body == "msg=x+y%26z",
+                  f"the POST was {site.posts[-1]}")
+            wait_for(lambda: "/thanks" in site.requests, 15, "the redirect after the POST")
+            check("Capsicum sandbox active" in s.read_log("xwebview"), "the browser isn't sandboxed")
+            mouse.close()
+            p.terminate()
+    finally:
+        if keys:
+            keys.close()
         os.environ.pop("FBX_TEST_WEB_LOCAL", None)
 
 
@@ -2446,6 +2556,7 @@ SCENARIOS = {
     "webnav": s_webnav,
     "webfont": s_webfont,
     "webpaint": s_webpaint,
+    "webform": s_webform,
     "replies": s_replies,
     "window-chrome": s_window_chrome,
     "persistence": s_persistence,
