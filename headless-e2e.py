@@ -1365,6 +1365,87 @@ def s_webcookies(work):
         os.environ.pop("FBX_TEST_WEB_LOCAL", None)
 
 
+def s_webscript(work):
+    """A page's own JavaScript runs on our engine, sandboxed: it builds part of the page,
+    a click listener recolours a button, a timer fires, typing raises input events, and
+    a submit listener cancels the form's sending."""
+    RED, GREEN, BLUE, PURPLE, YELLOW, ORANGE, CYAN = (220, 40, 40), (40, 200, 40), (40, 40, 220), (160, 40, 200), (250, 200, 0), (255, 120, 0), (0, 200, 200)
+    rgb = lambda c: "rgb(%d,%d,%d)" % c
+    page = f"""<!doctype html><title>Script</title><body style="margin:0;background:rgb(240,240,240)">
+        <div id=made></div>
+        <button id=b style="display:block;width:300px;height:60px;border:0;margin:10px;background:{rgb(RED)}"></button>
+        <div id=later style="width:300px;height:50px;margin:10px;background:rgb(240,240,240)"></div>
+        <form id=f action=/never><input name=q id=q style="display:block;width:300px;height:40px;border:0;margin:10px;background:{rgb(YELLOW)}"></form>
+        <script src=/app.js></script>""".encode()
+    app = f"""
+        const d = document.createElement('div');
+        d.style.cssText = 'width:300px;height:60px;margin:10px;background:{rgb(GREEN)}';
+        document.getElementById('made').appendChild(d);
+        document.getElementById('b').addEventListener('click', e => {{ e.target.style.background = '{rgb(BLUE)}'; }});
+        setTimeout(() => {{ document.getElementById('later').style.background = '{rgb(PURPLE)}'; }}, 300);
+        document.getElementById('q').addEventListener('input', e => {{
+            if (e.target.value === 'hi') document.getElementById('later').style.background = '{rgb(ORANGE)}';
+        }});
+        document.getElementById('f').addEventListener('submit', e => {{
+            e.preventDefault();
+            document.body.style.background = '{rgb(CYAN)}';
+        }});
+    """.encode()
+    site = FakeWebServer(extra={"/script": ("text/html", page), "/app.js": ("text/javascript", app)})
+    url = lambda path: f"http://127.0.0.1:{site.port}{path}"
+
+    def centre(s, colour, tag):
+        on_screen(s, colour, tag)
+        parts = open(os.path.join(s.logs, tag + ".ppm"), "rb").read().split(b"\n", 3)
+        w, h = map(int, parts[1].split())
+        xs, ys = [], []
+        for y in range(0, h, 2):
+            row = parts[3][y * w * 3:(y + 1) * w * 3]
+            for x in range(0, w, 2):
+                if all(abs(row[x * 3 + i] - colour[i]) < 10 for i in range(3)):
+                    xs.append(x)
+                    ys.append(y)
+        check(xs, f"nothing {colour} on screen ({tag})")
+        return (min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2
+
+    try:
+        os.environ["FBX_TEST_WEB_LOCAL"] = "1"
+        with Session(work, "webscript") as s:
+            s.shell()
+            keys = connect()
+            def press(code, ch=0):
+                for state in (1, 0):
+                    keys.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, struct.pack(INPUT_FMT, 2, code, state, 0, ch)))
+                    time.sleep(0.05)
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), url("/script")])
+            # The script built a block of its own.
+            wait_for(lambda: on_screen(s, GREEN, "made") > 1000, 30, "the block the script made")
+            check("Capsicum sandbox active" in s.read_log("xwebview"), "the browser isn't sandboxed")
+            check("/app.js" in site.requests, "the external script wasn't fetched")
+            # Its timer fires.
+            wait_for(lambda: on_screen(s, PURPLE, "timer") > 1000, 10, "the timer's colour")
+            # A click reaches its listener.
+            mouse = Pointer()
+            mouse.click(*centre(s, RED, "button"))
+            wait_for(lambda: on_screen(s, BLUE, "clicked") > 1000 and on_screen(s, RED, "clicked-red") < 100, 10, "the click listener's colour")
+            # Typing raises input events.
+            mouse.click(*centre(s, YELLOW, "field"))
+            time.sleep(0.3)
+            press(30, ord("h"))
+            press(30, ord("i"))
+            wait_for(lambda: on_screen(s, ORANGE, "typed") > 1000, 10, "the input listener's colour")
+            # Enter submits; the listener cancels it, so nothing is sent.
+            press(28)
+            wait_for(lambda: on_screen(s, CYAN, "submit") > 10000, 10, "the submit listener's colour")
+            time.sleep(1)
+            check(not any(r.startswith("/never") for r in site.requests), f"a cancelled form was sent: {site.requests}")
+            mouse.close()
+            keys.close()
+            p.terminate()
+    finally:
+        os.environ.pop("FBX_TEST_WEB_LOCAL", None)
+
+
 def s_webfont(work):
     """A page's own fonts come through the sandbox: text shows at once in another font, then
     takes the web font's shape when it arrives. Only what the text needs is fetched, a bad
@@ -2620,6 +2701,7 @@ SCENARIOS = {
     "webpaint": s_webpaint,
     "webform": s_webform,
     "webcookies": s_webcookies,
+    "webscript": s_webscript,
     "replies": s_replies,
     "window-chrome": s_window_chrome,
     "persistence": s_persistence,
