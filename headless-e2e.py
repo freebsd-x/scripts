@@ -1059,10 +1059,13 @@ h1{margin:20px 0;color:rgb(10,10,10)}img{display:block;margin-top:10px}</style>
 class FakeWebServer:
     """A small website on this machine, and a record of what was asked for."""
 
-    def __init__(self, extra=None, delays=None):
+    def __init__(self, extra=None, delays=None, set_cookies=None, by_cookie=None):
         import http.server
         outer = self
         self.requests = []
+        self.cookies = []   # (path, the Cookie header it came with)
+        set_cookies = set_cookies or {}   # path -> Set-Cookie values it answers with
+        by_cookie = by_cookie or {}       # path -> (cookie, page if sent, page if not)
         self.posts = []   # (path, content type, body) of each form sent
         delays = delays or {}
         png = os.path.join(tempfile.mkdtemp(prefix="fbx-web."), "dot.png")
@@ -1086,10 +1089,21 @@ class FakeWebServer:
             "/plain": ("text/plain", b"plain <b>text</b>"),
         }
         pages.update(extra or {})
+        self.pages = pages   # more can be added once the port is known
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 outer.requests.append(self.path)
+                outer.cookies.append((self.path, self.headers.get("Cookie", "")))
+                if self.path in by_cookie:
+                    want, yes, no = by_cookie[self.path]
+                    body = yes if want in self.headers.get("Cookie", "") else no
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 time.sleep(delays.get(self.path, 0))
                 if self.path.startswith("/l.css?"):   # an address too long for a message
                     self.path = "/l.css"
@@ -1103,6 +1117,8 @@ class FakeWebServer:
                 if self.path in pages:
                     kind, body = pages[self.path]
                     self.send_response(200)
+                    for c in set_cookies.get(self.path, []):
+                        self.send_header("Set-Cookie", c)
                 else:
                     kind, body = "text/html", f"""<!doctype html><title>Gone</title><body style=margin:0><div style="{box('200,40,160')}"></div>""".encode()
                     self.send_response(404)
@@ -1300,6 +1316,52 @@ def s_webform(work):
     finally:
         if keys:
             keys.close()
+        os.environ.pop("FBX_TEST_WEB_LOCAL", None)
+
+
+def s_webcookies(work):
+    """Cookies: a site's cookie comes back to it on the next page and with its own files,
+    is kept on disk where only the user can read it, and isn't sent with a file another
+    site's page loads (no third-party tracking)."""
+    GREEN, RED = (40, 200, 40), (220, 40, 40)
+    page = lambda colour, more="": f"<!doctype html><title>t</title><body style='margin:0;background:rgb({colour})'>{more}".encode()
+    site = FakeWebServer(
+        extra={"/login": ("text/html", page("40,200,40"))},
+        set_cookies={"/login": ["sid=abc123; Path=/; Max-Age=3600", "temp=1; Path=/"]},
+        by_cookie={"/me": ("sid=abc123", page("40,200,40", "<img src=/own.png>"), page("220,40,40"))},
+    )
+    local = lambda path: f"http://localhost:{site.port}{path}"
+    other = lambda path: f"http://127.0.0.1:{site.port}{path}"
+    # Another site (127.0.0.1 isn't localhost) whose page loads a file from the first.
+    site.pages["/elsewhere"] = ("text/html", page("40,40,220", f"<img src='{local('/track.png')}'>"))
+    try:
+        os.environ["FBX_TEST_WEB_LOCAL"] = "1"
+        with Session(work, "webcookies") as s:
+            s.shell()
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), local("/login")])
+            wait_for(lambda: on_screen(s, GREEN, "login") > 1000, 30, "the sign-in page")
+            p.terminate()
+            wait_for(lambda: on_screen(s, GREEN, "login-gone") < 100, 10, "the sign-in window to close")
+            # The next page on that site gets it back, and so does the page's own image.
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), local("/me")])
+            wait_for(lambda: any(path == "/me" for path, _ in site.cookies), 30, "the next page to be asked for")
+            wait_for(lambda: on_screen(s, GREEN, "me") > 1000 or on_screen(s, RED, "me-red") > 1000, 30, "the next page")
+            check(on_screen(s, GREEN, "me-check") > 1000, f"the cookie didn't come back: {site.cookies}")
+            wait_for(lambda: any(path == "/own.png" for path, _ in site.cookies), 15, "the page's own image")
+            own = [c for path, c in site.cookies if path == "/own.png"][-1]
+            check("sid=abc123" in own and "temp=1" in own, f"the site's own image went without its cookies: {own!r}")
+            p.terminate()
+            # Another site's page loading a file from it: no cookie goes along.
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), other("/elsewhere")])
+            wait_for(lambda: any(path == "/track.png" for path, _ in site.cookies), 30, "the other site's page to load the file")
+            tracked = [c for path, c in site.cookies if path == "/track.png"][-1]
+            check("sid" not in tracked, f"a cookie went to a third party: {tracked!r}")
+            p.terminate()
+            # Kept on disk, for the user alone.
+            jar = os.path.join(s.home, ".local", "share", "freebsdx", "cookies.txt")
+            wait_for(lambda: os.path.exists(jar) and "abc123" in open(jar).read(), 15, "the cookie to be written down")
+            check(oct(os.stat(jar).st_mode & 0o777) == "0o600", f"the cookie file is {oct(os.stat(jar).st_mode & 0o777)}")
+    finally:
         os.environ.pop("FBX_TEST_WEB_LOCAL", None)
 
 
@@ -2557,6 +2619,7 @@ SCENARIOS = {
     "webfont": s_webfont,
     "webpaint": s_webpaint,
     "webform": s_webform,
+    "webcookies": s_webcookies,
     "replies": s_replies,
     "window-chrome": s_window_chrome,
     "persistence": s_persistence,
