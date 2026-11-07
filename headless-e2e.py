@@ -1122,10 +1122,12 @@ class FakeWebServer:
 
 def s_webpaint(work):
     """What a page draws besides boxes and text comes through the sandbox: gradients, SVG
-    inline and as files, CSS images from a stylesheet's own folder, and masks. A box that
-    clips its overflow clips its positioned children too."""
+    inline and as files, CSS images from a stylesheet's own folder, masks, rounded and
+    dashed borders, and shadows. A box that clips its overflow clips its positioned
+    children too."""
     RED, BLUE, GREEN, YELLOW = (220, 40, 40), (40, 40, 220), (20, 180, 60), (250, 200, 0)
     PURPLE, ORANGE, CYAN, PINK = (160, 40, 200), (255, 120, 0), (0, 200, 200), (230, 60, 150)
+    RING, SHADOW, DASH = (0, 90, 255), (255, 0, 140), (120, 60, 0)
     rgb = lambda c: "rgb(%d,%d,%d)" % c
     svg = lambda body, size="width='20' height='20'": ("image/svg+xml", f"<svg xmlns='http://www.w3.org/2000/svg' {size}>{body}</svg>".encode())
     page = f"""<!doctype html><title>Paint</title><link rel=stylesheet href=/css/site.css>
@@ -1136,7 +1138,10 @@ def s_webpaint(work):
         <div style="width:100px;height:100px;background:{rgb(PURPLE)};mask:url(/mask.svg) no-repeat center/contain;-webkit-mask:url(/mask.svg) no-repeat center/contain"></div>
         <img src=/logo.svg width=60 height=60 style="margin-left:10px">
         <div style="position:relative;overflow:hidden;width:100px;height:40px"><div style="position:absolute;left:-100%;top:0;width:300%;height:100%;background:{rgb(CYAN)}"></div></div>
-        <div class=sheet></div>""".encode()
+        <div class=sheet></div>
+        <div style="position:absolute;left:700px;top:20px;width:100px;height:100px;border-radius:50%;border:10px solid {rgb(RING)}"></div>
+        <div style="position:absolute;left:700px;top:200px;width:60px;height:60px;background:white;box-shadow:0 0 0 10px {rgb(SHADOW)}"></div>
+        <div style="position:absolute;left:700px;top:320px;width:200px;height:0;border-top:4px dashed {rgb(DASH)}"></div>""".encode()
     site = FakeWebServer(extra={
         "/paint": ("text/html", page),
         "/css/site.css": ("text/css", b".sheet{width:160px;height:60px;background:url(../img/bg.svg) 0 0/40px 30px}"),
@@ -1171,6 +1176,15 @@ def s_webpaint(work):
             wait_for(lambda: abs(on_screen(s, PURPLE, "mask") - disc) < disc * 0.15, 20, f"the masked colour as a disc of about {disc:.0f}")
             # Relative to the stylesheet's folder, not the page's.
             check("/img/bg.svg" in site.requests, f"the sheet's image wasn't fetched from beside it: {site.requests}")
+            # A round border is a ring; a spread shadow a frame round its box; a dashed line has gaps.
+            ring = 3.14159 * (60 * 60 - 50 * 50) / 4
+            got = on_screen(s, RING, "ring")
+            check(abs(got - ring) < ring * 0.2, f"the round border: {got}, want about {ring:.0f}")
+            frame = (80 * 80 - 60 * 60) / 4
+            got = on_screen(s, SHADOW, "shadow")
+            check(abs(got - frame) < frame * 0.2, f"the spread shadow: {got}, want about {frame:.0f}")
+            got = on_screen(s, DASH, "dash")
+            check(area(200, 4) * 0.25 < got < area(200, 4) * 0.85, f"the dashed line: {got} of a solid {area(200, 4):.0f}")
             # Overflow clips the positioned child: only the parent's 100x40 shows.
             cyan = on_screen(s, CYAN, "cyan")
             check(abs(cyan - area(100, 40)) < area(100, 40) * 0.2, f"the clipped child shows {cyan}, want about {area(100, 40):.0f}")
