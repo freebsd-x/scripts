@@ -1368,8 +1368,9 @@ def s_webcookies(work):
 def s_webscript(work):
     """A page's own JavaScript runs on our engine, sandboxed: a module (through an import
     map, with an async generator and await) builds part of the page, a click listener
-    recolours a button, a timer fires, typing raises input events that regular
-    expressions check, and a submit listener cancels the form's sending."""
+    recolours a button, a timer fires and fetches JSON whose date a Date reads, typing
+    raises input events that regular expressions check, and a submit listener cancels
+    the form's sending."""
     RED, GREEN, BLUE, PURPLE, YELLOW, ORANGE, CYAN = (220, 40, 40), (40, 200, 40), (40, 40, 220), (160, 40, 200), (250, 200, 0), (255, 120, 0), (0, 200, 200)
     rgb = lambda c: "rgb(%d,%d,%d)" % c
     page = f"""<!doctype html><title>Script</title><body style="margin:0;background:rgb(240,240,240)">
@@ -1393,7 +1394,11 @@ def s_webscript(work):
     """
     app = f"""
         document.getElementById('b').addEventListener('click', e => {{ e.target.style.background = '{rgb(BLUE)}'; }});
-        setTimeout(() => {{ document.getElementById('later').style.background = '{rgb(PURPLE)}'; }}, 300);
+        setTimeout(async () => {{
+            const data = await (await fetch('/data.json')).json();
+            if (new Date(data.when).getUTCFullYear() === 2026 && new Uint8Array(data.bytes).reduce((a, b) => a + b) === 6)
+                document.getElementById('later').style.background = '{rgb(PURPLE)}';
+        }}, 300);
         document.getElementById('q').addEventListener('input', e => {{
             // Checked with regular expressions, as pages check what's typed.
             const v = e.target.value;
@@ -1405,7 +1410,9 @@ def s_webscript(work):
             document.body.style.background = '{rgb(CYAN)}';
         }});
     """.encode()
-    site = FakeWebServer(extra={"/script": ("text/html", page), "/app.js": ("text/javascript", app), "/blocks.js": ("text/javascript", blocks)})
+    data = b'{"when": "2026-11-08T12:00:00Z", "bytes": [1, 2, 3]}'
+    site = FakeWebServer(extra={"/script": ("text/html", page), "/app.js": ("text/javascript", app), "/blocks.js": ("text/javascript", blocks),
+                                "/data.json": ("application/json", data)})
     url = lambda path: f"http://127.0.0.1:{site.port}{path}"
 
     def centre(s, colour, tag):
@@ -1437,8 +1444,9 @@ def s_webscript(work):
             check("/blocks.js" in site.requests, "the module's import (through the import map) wasn't fetched")
             check("Capsicum sandbox active" in s.read_log("xwebview"), "the browser isn't sandboxed")
             check("/app.js" in site.requests, "the external script wasn't fetched")
-            # Its timer fires.
-            wait_for(lambda: on_screen(s, PURPLE, "timer") > 1000, 10, "the timer's colour")
+            # Its timer fires, fetches the JSON, and reads it.
+            wait_for(lambda: on_screen(s, PURPLE, "timer") > 1000, 15, "the colour the timer's fetch sets")
+            check("/data.json" in site.requests, "the script's fetch didn't reach the server")
             # A click reaches its listener.
             mouse = Pointer()
             mouse.click(*centre(s, RED, "button"))
