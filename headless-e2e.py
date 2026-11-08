@@ -1366,9 +1366,10 @@ def s_webcookies(work):
 
 
 def s_webscript(work):
-    """A page's own JavaScript runs on our engine, sandboxed: it builds part of the page,
-    a click listener recolours a button, a timer fires, typing raises input events that
-    regular expressions check, and a submit listener cancels the form's sending."""
+    """A page's own JavaScript runs on our engine, sandboxed: a module (through an import
+    map, with an async generator and await) builds part of the page, a click listener
+    recolours a button, a timer fires, typing raises input events that regular
+    expressions check, and a submit listener cancels the form's sending."""
     RED, GREEN, BLUE, PURPLE, YELLOW, ORANGE, CYAN = (220, 40, 40), (40, 200, 40), (40, 40, 220), (160, 40, 200), (250, 200, 0), (255, 120, 0), (0, 200, 200)
     rgb = lambda c: "rgb(%d,%d,%d)" % c
     page = f"""<!doctype html><title>Script</title><body style="margin:0;background:rgb(240,240,240)">
@@ -1376,11 +1377,21 @@ def s_webscript(work):
         <button id=b style="display:block;width:300px;height:60px;border:0;margin:10px;background:{rgb(RED)}"></button>
         <div id=later style="width:300px;height:50px;margin:10px;background:rgb(240,240,240)"></div>
         <form id=f action=/never><input name=q id=q style="display:block;width:300px;height:40px;border:0;margin:10px;background:{rgb(YELLOW)}"></form>
+        <script type=importmap>{{"imports": {{"blocks": "/blocks.js"}}}}</script>
+        <script type=module>
+            import {{ block }} from 'blocks';
+            async function* colours() {{ yield await new Promise(r => setTimeout(() => r('{rgb(GREEN)}'), 50)); }}
+            for await (const c of colours()) document.getElementById('made').appendChild(block(c));
+        </script>
         <script src=/app.js></script>""".encode()
+    blocks = b"""
+        export function block(colour) {
+            const d = document.createElement('div');
+            d.style.cssText = 'width:300px;height:60px;margin:10px;background:' + colour;
+            return d;
+        }
+    """
     app = f"""
-        const d = document.createElement('div');
-        d.style.cssText = 'width:300px;height:60px;margin:10px;background:{rgb(GREEN)}';
-        document.getElementById('made').appendChild(d);
         document.getElementById('b').addEventListener('click', e => {{ e.target.style.background = '{rgb(BLUE)}'; }});
         setTimeout(() => {{ document.getElementById('later').style.background = '{rgb(PURPLE)}'; }}, 300);
         document.getElementById('q').addEventListener('input', e => {{
@@ -1394,7 +1405,7 @@ def s_webscript(work):
             document.body.style.background = '{rgb(CYAN)}';
         }});
     """.encode()
-    site = FakeWebServer(extra={"/script": ("text/html", page), "/app.js": ("text/javascript", app)})
+    site = FakeWebServer(extra={"/script": ("text/html", page), "/app.js": ("text/javascript", app), "/blocks.js": ("text/javascript", blocks)})
     url = lambda path: f"http://127.0.0.1:{site.port}{path}"
 
     def centre(s, colour, tag):
@@ -1421,8 +1432,9 @@ def s_webscript(work):
                     keys.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, struct.pack(INPUT_FMT, 2, code, state, 0, ch)))
                     time.sleep(0.05)
             p = s.start("xwebview", [os.path.join(OUT, "xwebview"), url("/script")])
-            # The script built a block of its own.
-            wait_for(lambda: on_screen(s, GREEN, "made") > 1000, 30, "the block the script made")
+            # The module built a block of its own.
+            wait_for(lambda: on_screen(s, GREEN, "made") > 1000, 30, "the block the module made")
+            check("/blocks.js" in site.requests, "the module's import (through the import map) wasn't fetched")
             check("Capsicum sandbox active" in s.read_log("xwebview"), "the browser isn't sandboxed")
             check("/app.js" in site.requests, "the external script wasn't fetched")
             # Its timer fires.
