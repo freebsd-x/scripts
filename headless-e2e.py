@@ -1367,7 +1367,8 @@ def s_webcookies(work):
 
 def s_webscript(work):
     """A page's own JavaScript runs on our engine, sandboxed: a module (through an import
-    map, with an async generator and await) builds part of the page, a click listener
+    map, with an async generator and await) builds part of the page as a custom element
+    drawn in its shadow root, a click listener
     recolours a button, a timer fires and fetches JSON whose date a Date reads, typing
     raises input events that regular expressions check, and a submit listener cancels
     the form's sending."""
@@ -1386,10 +1387,22 @@ def s_webscript(work):
         </script>
         <script src=/app.js></script>""".encode()
     blocks = b"""
+        // A custom element that draws itself in a shadow root, styled from inside it.
+        class ColourBlock extends HTMLElement {
+            static observedAttributes = ['colour'];
+            constructor() { super(); this.attachShadow({mode: 'open'}); }
+            attributeChangedCallback() { this.render(); }
+            connectedCallback() { this.render(); }
+            render() {
+                this.shadowRoot.innerHTML = '<style>:host { display: block } div { width: 300px; height: 60px; margin: 10px; background: ' +
+                    this.getAttribute('colour') + ' }</style><div></div>';
+            }
+        }
+        customElements.define('colour-block', ColourBlock);
         export function block(colour) {
-            const d = document.createElement('div');
-            d.style.cssText = 'width:300px;height:60px;margin:10px;background:' + colour;
-            return d;
+            const b = document.createElement('colour-block');
+            b.setAttribute('colour', colour);
+            return b;
         }
     """
     app = f"""
