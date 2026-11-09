@@ -1127,6 +1127,20 @@ class FakeWebServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def do_PUT(self):
+                # A script's request with its own method and header: what came, echoed back
+                # with a header of the reply's own.
+                n = int(self.headers.get("Content-Length", "0") or 0)
+                got = self.rfile.read(n).decode("utf-8", "replace")
+                outer.requests.append("PUT " + self.path)
+                body = f"PUT:{self.headers.get('X-Token', '')}:{got}".encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("X-Reply", "yes")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_POST(self):
                 # A form sent: noted, then off to a page of thanks, as sites do.
                 n = int(self.headers.get("Content-Length", "0") or 0)
@@ -1300,7 +1314,8 @@ def s_webform(work):
             # A POST form: its body reaches the site, and the redirect after it is followed.
             p.terminate()
             p = s.start("xwebview", [os.path.join(OUT, "xwebview"), url("/form")])
-            wait_for(lambda: on_screen(s, GREEN, "post-form") > 1000, 30, "the form a third time")
+            # Its own field too: the green alone could still be the last page going away.
+            wait_for(lambda: on_screen(s, GREEN, "post-form") > 1000 and on_screen(s, BLUE, "msg") > 1000, 30, "the form a third time")
             mouse.click(*centre(s, BLUE, "msg"))
             time.sleep(0.3)
             type_text("x y&z")
@@ -1369,7 +1384,8 @@ def s_webscript(work):
     """A page's own JavaScript runs on our engine, sandboxed: a module (through an import
     map, with an async generator and await) builds part of the page as a custom element
     drawn in its shadow root, a click listener
-    recolours a button, a timer fires and fetches JSON whose date a Date reads, typing
+    recolours a button, a timer fires and fetches JSON whose date a Date reads (and PUTs
+    with a header of its own, reading the reply's headers back), typing
     raises input events that regular expressions check, and a submit listener cancels
     the form's sending."""
     RED, GREEN, BLUE, PURPLE, YELLOW, ORANGE, CYAN = (220, 40, 40), (40, 200, 40), (40, 40, 220), (160, 40, 200), (250, 200, 0), (255, 120, 0), (0, 200, 200)
@@ -1409,7 +1425,10 @@ def s_webscript(work):
         document.getElementById('b').addEventListener('click', e => {{ e.target.style.background = '{rgb(BLUE)}'; }});
         setTimeout(async () => {{
             const data = await (await fetch('/data.json')).json();
-            if (new Date(data.when).getUTCFullYear() === 2026 && new Uint8Array(data.bytes).reduce((a, b) => a + b) === 6)
+            const put = await fetch('/echo', {{method: 'PUT', headers: {{'X-Token': 'tk'}}, body: 'hi'}});
+            const echoed = await put.text();
+            if (new Date(data.when).getUTCFullYear() === 2026 && new Uint8Array(data.bytes).reduce((a, b) => a + b) === 6 &&
+                echoed === 'PUT:tk:hi' && put.headers.get('X-Reply') === 'yes')
                 document.getElementById('later').style.background = '{rgb(PURPLE)}';
         }}, 300);
         document.getElementById('q').addEventListener('input', e => {{
@@ -1460,6 +1479,7 @@ def s_webscript(work):
             # Its timer fires, fetches the JSON, and reads it.
             wait_for(lambda: on_screen(s, PURPLE, "timer") > 1000, 15, "the colour the timer's fetch sets")
             check("/data.json" in site.requests, "the script's fetch didn't reach the server")
+            check("PUT /echo" in site.requests, "the script's PUT with its own header didn't reach the server")
             # A click reaches its listener.
             mouse = Pointer()
             mouse.click(*centre(s, RED, "button"))
