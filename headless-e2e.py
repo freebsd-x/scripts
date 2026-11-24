@@ -2800,7 +2800,62 @@ def s_idle_lock(work):
         c.close()
 
 
+def s_webhover(work):
+    """The pointer and the keyboard show on a page: a menu only :hover opens, :active and
+    :focus-within, and the events scripts hear, in order."""
+    GREEN, BLUE, RED, GREY = (40, 200, 40), (40, 40, 220), (220, 40, 40), (200, 190, 180)
+    rgb = lambda c: "rgb(%d,%d,%d)" % c
+    path = os.path.join(work, "hover.html")
+    with open(path, "w") as f:
+        f.write(f"""<!doctype html><title>Hover</title><style>
+            body {{ margin: 0 }} div {{ box-sizing: border-box }}
+            #menu {{ position: absolute; left: 100px; top: 50px; width: 200px; height: 60px; background: {rgb(GREY)} }}
+            #sub {{ display: none; position: absolute; left: 0; top: 60px; width: 400px; height: 100px; background: {rgb(GREEN)} }}
+            #menu:hover #sub {{ display: block }}
+            #btn {{ position: absolute; left: 600px; top: 50px; width: 200px; height: 100px; background: {rgb(GREY)} }}
+            #btn:active {{ background: {rgb(RED)} }}
+            #form {{ position: absolute; left: 100px; top: 400px; width: 400px; height: 120px; background: {rgb(GREY)} }}
+            #form:focus-within {{ background: {rgb(BLUE)} }}
+            #q {{ margin: 40px; width: 100px }}
+            </style><div id=menu><div id=sub></div></div><div id=btn></div><div id=form><input id=q></div><script>
+            const log = [];
+            for (const [id, types] of [['menu', 'mouseenter mouseleave mouseover'], ['sub', 'mouseenter mouseover'], ['btn', 'pointerdown mousedown mouseup click'], ['q', 'focus blur']])
+                for (const t of types.split(' ')) document.getElementById(id).addEventListener(t, e => {{ log.push(t + '@' + e.target.id); console.log(log.join(' ') + ';'); }});
+            </script>""")
+    with Session(work, "webhover") as s:
+        s.shell()
+        s.start("browser", [os.path.join(OUT, "browser"), "file://" + path])
+        wait_for(lambda: on_screen(s, GREY, "hover0") > 2000, 20, "the page")
+        ptr, OX, OY = Pointer(), 360, 174        # where a window's page is
+        def move(x, y):
+            ptr._inject(INPUT_MOUSE_MOVE, -10000, -10000)
+            ptr._inject(INPUT_MOUSE_MOVE, OX + x, OY + y)
+        def said(text):
+            return text in s.read_log("browser")
+        check(on_screen(s, GREEN, "hover1") == 0, "the menu is open before the pointer's on it")
+        move(200, 80)
+        wait_for(lambda: on_screen(s, GREEN, "hover2") > 2000, 10, "the menu to open")
+        move(300, 150)                           # into the open menu, outside its parent's box
+        time.sleep(0.5)
+        check(on_screen(s, GREEN, "hover3") > 2000, "the menu closed with the pointer in it")
+        move(900, 700)
+        wait_for(lambda: on_screen(s, GREEN, "hover4") == 0, 10, "the menu to close")
+        check(said("mouseenter@menu") and said("mouseenter@sub") and said("mouseleave@menu"), "mouseenter and mouseleave")
+        move(700, 100)
+        ptr._inject(INPUT_MOUSE_BUTTON, BTN_LEFT, 1)
+        wait_for(lambda: on_screen(s, RED, "hover5") > 500, 10, ":active while pressed")
+        check(not said("click@btn"), "click before it's let go")
+        ptr._inject(INPUT_MOUSE_BUTTON, BTN_LEFT, 0)
+        wait_for(lambda: said("pointerdown@btn mousedown@btn mouseup@btn click@btn"), 10, "a press's events, in order")
+        wait_for(lambda: on_screen(s, RED, "hover6") == 0, 10, ":active to go")
+        ptr.click(OX + 180, OY + 455)
+        wait_for(lambda: on_screen(s, BLUE, "hover7") > 500, 10, ":focus-within")
+        check(said("focus@q"), "focus")
+        ptr.close()
+
+
 SCENARIOS = {
+    "webhover": s_webhover,
     "idle-lock": s_idle_lock,
     "file-open": s_file_open,
     "media": s_media,
