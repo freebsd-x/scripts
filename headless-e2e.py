@@ -2744,7 +2744,64 @@ def s_smoke_tools(work):
     check(not failed, "failed: " + ", ".join(failed))
 
 
+def s_idle_lock(work):
+    """Idle locks the screen, then darkens it; a key wakes it. While it's locked, nothing
+    but the lock screen is drawn or gets input (even if it dies: another starts), and
+    nothing else can pass for it or try passwords. An app's hold keeps it from locking."""
+    def ev(c, t, a=0, b=0, ch=0):
+        c.send(xbus_msg("com.freebsdx.Headless", HEADLESS_INJECT, struct.pack(INPUT_FMT, t, a, b, 0, ch)))
+        time.sleep(0.15 * TIME_SCALE)
+
+    def count(s, text):
+        return s.read_log("compositor").count(text)
+
+    LOCK, IDLE = "com.freebsdx.Lock", "com.freebsdx.Idle"
+    UNLOCK, REGISTER, HOLD = 2, 7, 2
+    config = "screenlock.enabled=1\nscreenlock.timeout=6\nscreen.timeout_secs=600\nidle.locked_off_secs=4\n"
+    red = os.path.join(work, "red.png")
+    write_png(red, 64, 64, (220, 40, 40))
+    with Session(work, "idle-lock", strict=True, config=config) as s:
+        holder = connect()
+        holder.send(xbus_msg(IDLE, HOLD))
+        s.shell()
+        launch_with_file("com.freebsdx.imageviewer", red)
+        wait_for(lambda: on_screen(s, (220, 40, 40), "before") > 5000, 15, "the picture on screen")
+        time.sleep(9)
+        check(count(s, "Screen locked") == 0, "locked although held off")
+        holder.close()                                  # gone: its hold with it
+        wait_for(lambda: count(s, "Screen locked") == 1, 15, "the idle lock")
+        wait_for(lambda: count(s, "Lock screen registered") == 1, 15, "the lock screen")
+        check(on_screen(s, (220, 40, 40), "locked") == 0, "the desktop shows while locked")
+        wait_for(lambda: count(s, "[Idle] Screen off") == 1, 15, "the screen to go dark")
+        time.sleep(0.5)
+        check(on_screen(s, (0, 0, 0), "dark") > 50000, "a dark screen isn't black")
+        c = connect()
+        ev(c, 2, 30, 1, ord("a")), ev(c, 2, 30, 0)
+        wait_for(lambda: count(s, "[Idle] Screen on") == 1, 5, "a key to wake it")
+        check(count(s, "Screen unlocked") == 0, "waking it unlocked it")
+
+        # Passing for the lock screen, and guessing at the password.
+        evil = connect()
+        evil.send(xbus_msg(LOCK, REGISTER))
+        evil.send(xbus_msg(LOCK, UNLOCK, struct.pack("64s188s4x", b"", b"guess")))
+        evil.send(xbus_msg("com.freebsdx.ScreenLock", 2, struct.pack("<IIII240x", 0, 0, 1, 1)))
+        evil.send(xbus_msg(LOCK, 4, struct.pack("<I252x", 0)))      # SetTimeout: never
+        wait_for(lambda: count(s, "DENIED: com.freebsdx.ScreenLock op 2") == 1 and count(s, "DENIED: com.freebsdx.Lock op 4") == 1, 5, "auto-lock changes refused")
+        wait_for(lambda: count(s, "DENIED: Register") == 1 and count(s, "DENIED: Unlock") == 1, 5, "both refused")
+        evil.close()
+
+        # The lock screen killed: still locked, nothing shown or typed, and another starts.
+        subprocess.run(["pkill", "-9", "-f", "out/lockscreen|^lockscreen"], check=False)
+        ev(c, 6)                                        # Super+Space, which opens search
+        check(on_screen(s, (220, 40, 40), "killed") == 0, "the desktop shows with the lock screen gone")
+        wait_for(lambda: count(s, "Lock screen registered") == 2, 15, "another lock screen")
+        check(on_screen(s, (220, 40, 40), "again") == 0, "the desktop shows while locked")
+        check(count(s, "Screen unlocked") == 0, "killing the lock screen unlocked it")
+        c.close()
+
+
 SCENARIOS = {
+    "idle-lock": s_idle_lock,
     "file-open": s_file_open,
     "media": s_media,
     "mail": s_mail,
