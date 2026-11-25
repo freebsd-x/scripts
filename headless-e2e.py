@@ -2854,7 +2854,43 @@ def s_webhover(work):
         ptr.close()
 
 
+def s_webbusy(work):
+    """A page whose script is busy still scrolls, and its clicks wait their turn."""
+    GREEN, BLUE = (40, 180, 60), (40, 40, 220)
+    rgb = lambda c: "rgb(%d,%d,%d)" % c
+    path = os.path.join(work, "busy.html")
+    with open(path, "w") as f:
+        f.write(f"""<!doctype html><title>Busy</title><style>body {{ margin: 0 }}
+            #top {{ height: 900px; background: {rgb(GREEN)} }} #low {{ height: 6000px; background: {rgb(BLUE)} }}</style>
+            <div id=top></div><div id=low></div><script>
+            document.addEventListener('click', e => console.log('clicked ' + e.target.id + ';'));
+            setTimeout(() => {{ console.log('busy;'); const end = Date.now() + 4500; let n = 0; while (Date.now() < end) n += [3, 1, 2].sort().length; console.log('free ' + (n > 0) + ';'); }}, 1500);
+            </script>""")
+    with Session(work, "webbusy") as s:
+        s.shell()
+        s.start("browser", [os.path.join(OUT, "browser"), "file://" + path])
+        said = lambda text: text in s.read_log("browser")
+        wait_for(lambda: on_screen(s, GREEN, "busy0") > 2000, 20, "the page")
+        ptr, OX, OY = Pointer(), 360, 174
+        ptr._inject(INPUT_MOUSE_MOVE, -10000, -10000)
+        ptr._inject(INPUT_MOUSE_MOVE, OX + 300, OY + 300)
+        wait_for(lambda: said("busy;"), 10, "the script to start")
+        time.sleep(0.3)
+        for _ in range(4):
+            ptr._inject(INPUT_MOUSE_WHEEL, 0, 3)
+            time.sleep(0.05)
+        wait_for(lambda: on_screen(s, BLUE, "busy1") > 2000, 5, "it to scroll while its script runs")
+        check(not said("free"), "the script was still running")
+        ptr.click(OX + 300, OY + 400)
+        time.sleep(0.5)
+        check(not said("clicked"), "a click's handlers ran in the middle of a script")
+        wait_for(lambda: said("free true;"), 15, "the script to end")
+        wait_for(lambda: said("clicked low;"), 10, "the click, after it, where it was scrolled to")
+        ptr.close()
+
+
 SCENARIOS = {
+    "webbusy": s_webbusy,
     "webhover": s_webhover,
     "idle-lock": s_idle_lock,
     "file-open": s_file_open,
