@@ -1067,6 +1067,7 @@ class FakeWebServer:
         set_cookies = set_cookies or {}   # path -> Set-Cookie values it answers with
         by_cookie = by_cookie or {}       # path -> (cookie, page if sent, page if not)
         self.posts = []   # (path, content type, body) of each form sent
+        self.redirects = {}   # path -> where a 302 sends it
         delays = delays or {}
         png = os.path.join(tempfile.mkdtemp(prefix="fbx-web."), "dot.png")
         write_png(png, 64, 64, (40, 200, 40))
@@ -1103,6 +1104,12 @@ class FakeWebServer:
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
+                    return
+                if self.path in outer.redirects:
+                    self.send_response(302)
+                    self.send_header("Location", outer.redirects[self.path])
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
                     return
                 time.sleep(delays.get(self.path, 0))
                 if self.path.startswith("/l.css?"):   # an address too long for a message
@@ -1334,6 +1341,22 @@ def s_webform(work):
         os.environ.pop("FBX_TEST_WEB_LOCAL", None)
 
 
+def centre_of(s, colour, tag):
+    """Where on screen `colour` is: the middle of everything that colour."""
+    on_screen(s, colour, tag)
+    parts = open(os.path.join(s.logs, tag + ".ppm"), "rb").read().split(b"\n", 3)
+    w, h = map(int, parts[1].split())
+    xs, ys = [], []
+    for y in range(0, h, 2):
+        row = parts[3][y * w * 3:(y + 1) * w * 3]
+        for x in range(0, w, 2):
+            if all(abs(row[x * 3 + i] - colour[i]) < 10 for i in range(3)):
+                xs.append(x)
+                ys.append(y)
+    check(xs, f"nothing {colour} on screen ({tag})")
+    return (min(xs) + max(xs)) // 2, (min(ys) + max(ys)) // 2
+
+
 def s_webcookies(work):
     """Cookies: a site's cookie comes back to it on the next page and with its own files,
     is kept on disk where only the user can read it, and isn't sent with a file another
@@ -1372,6 +1395,36 @@ def s_webcookies(work):
             tracked = [c for path, c in site.cookies if path == "/track.png"][-1]
             check("sid" not in tracked, f"a cookie went to a third party: {tracked!r}")
             p.terminate()
+            # A redirect within the site keeps its cookies (xfetch follows those itself).
+            site.redirects["/home"] = "/me"
+            asked = len(site.cookies)
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), local("/home")])
+            wait_for(lambda: any(path == "/me" for path, _ in site.cookies[asked:]), 30, "the redirect to be followed")
+            sent = [c for path, c in site.cookies[asked:] if path == "/me"][-1]
+            check("sid=abc123" in sent, f"a redirect within the site lost its cookies: {sent!r}")
+            p.terminate()
+            # One from another site doesn't: that process is the other site's, and what the
+            # first site shows its user mustn't come back to it.
+            site.redirects["/hop"] = local("/me")
+            asked = len(site.cookies)
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), other("/hop")])
+            wait_for(lambda: any(path == "/me" for path, _ in site.cookies[asked:]), 30, "the other site's redirect to be followed")
+            sent = [c for path, c in site.cookies[asked:] if path == "/me"][0]
+            check("sid" not in sent, f"another site's redirect carried this site's cookie: {sent!r}")
+            # ...and the page goes on in a process of the site's own, in the same window,
+            # which does send them; the first process ends.
+            wait_for(lambda: any(path == "/me" and "sid=abc123" in c for path, c in site.cookies[asked:]), 30,
+                     "the site's own process to ask for its page")
+            wait_for(lambda: p.poll() is not None, 15, "the first process to end")
+            wait_for(lambda: on_screen(s, GREEN, "handed-off") > 1000, 30, "the signed-in page in the new process")
+            # A link to another site, the same way: 127.0.0.1's page in a new process.
+            YELLOW, BLUE = (230, 200, 40), (40, 40, 220)
+            site.pages["/to-other"] = ("text/html", page("240,240,240", f"<a href='{other('/elsewhere')}' style='display:block;width:300px;height:200px;background:rgb(230,200,40)'></a>"))
+            p = s.start("xwebview", [os.path.join(OUT, "xwebview"), local("/to-other")])
+            wait_for(lambda: on_screen(s, YELLOW, "link") > 1000, 30, "the page with the link")
+            Pointer().click(*centre_of(s, YELLOW, "link-at"))
+            wait_for(lambda: p.poll() is not None, 30, "the first process to hand the link on and end")
+            wait_for(lambda: on_screen(s, BLUE, "other-site") > 1000, 30, "the other site's page in its own process")
             # Kept on disk, for the user alone.
             jar = os.path.join(s.home, ".local", "share", "freebsdx", "cookies.txt")
             wait_for(lambda: os.path.exists(jar) and "abc123" in open(jar).read(), 15, "the cookie to be written down")
